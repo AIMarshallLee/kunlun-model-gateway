@@ -1,5 +1,6 @@
 const CLIENT_IP_HEADER = "X-Kunlun-Client-IP";
 const PROXY_SECRET_HEADER = "X-Kunlun-Proxy-Secret";
+const SUPABASE_CA_PATH = "/app/certs/supabase-prod-ca-2021.crt";
 
 const REQUIRED_BINDINGS = [
   "KUNLUN_DATABASE_URL",
@@ -20,15 +21,18 @@ export function missingRequiredBindings(
       try {
         const url = new URL(value);
         const sslModes = url.searchParams.getAll("sslmode");
+        const rootCertificates = url.searchParams.getAll("sslrootcert");
         const sslMode = sslModes[0]?.toLowerCase();
         return (
           url.protocol !== "postgresql+psycopg:" ||
           !url.hostname ||
           !url.username ||
+          !url.password ||
           url.pathname.length < 2 ||
           sslModes.length !== 1 ||
-          !sslMode ||
-          !["require", "verify-ca", "verify-full"].includes(sslMode)
+          sslMode !== "verify-full" ||
+          rootCertificates.length !== 1 ||
+          rootCertificates[0] !== SUPABASE_CA_PATH
         );
       } catch {
         return true;
@@ -36,6 +40,13 @@ export function missingRequiredBindings(
     }
     return value.length < 32;
   });
+}
+
+export function deploymentUnavailableResponse(): Response {
+  return Response.json(
+    { error: "service_unavailable" },
+    { status: 503, headers: { "Cache-Control": "no-store" } },
+  );
 }
 
 function decodedPath(pathname: string): string | null {

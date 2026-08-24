@@ -5,7 +5,35 @@ from __future__ import annotations
 from sqlalchemy import Engine, text
 
 
-SCHEMA_HEAD = "0007_payment_reconcile_claim"
+SCHEMA_HEAD = "0010_runtime_contract"
+
+# Every application-owned table in the public schema.  Keep this allow-list
+# explicit: a Supabase deployment may contain unrelated extension tables that
+# must not accidentally receive Kunlun grants or policies.
+KUNLUN_BUSINESS_TABLES = (
+    "users",
+    "access_sessions",
+    "api_keys",
+    "budgets",
+    "email_verification_tokens",
+    "password_reset_tokens",
+    "ledger_transactions",
+    "payment_orders",
+    "wallets",
+    "ledger_entries",
+    "model_requests",
+    "payment_webhook_events",
+    "rate_limit_counters",
+    "operator_actions",
+    "provider_attempts",
+    "payment_refunds",
+    "safety_audits",
+    "model_prices",
+    "auth_rate_limit_counters",
+    "outbox_events",
+)
+
+IMMUTABLE_APPEND_TABLES = ("ledger_transactions", "ledger_entries", "operator_actions")
 
 LEDGER_TRIGGER_NAMES = (
     "ledger_transactions_no_update",

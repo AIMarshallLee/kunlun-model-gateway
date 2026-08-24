@@ -144,7 +144,7 @@ export KUNLUN_GATEWAY_API_KEY='仅粘贴创建时显示一次的 gw_... Key'
 
 ## 已实现、待验证与不做事项
 
-已实现（代码与本地验证范围）：注册/登录、邮件验证/密码恢复服务、API Key 摘要保存与吊销、Turnstile hostname/action 服务端绑定、可信代理 IP 边界、测试 HMAC 订单回调幂等、现金支付与服务额度分离的整数双式账本、余额/预算预授权与结算、OpenAI-compatible 非流式与 SSE 流式接口、工具调用字段透传及完整输入安全检查、流式断线/5xx 待对账、供应商受限故障切换、成本台账、输入输出内容安全流式响应上限、运维短令牌、checkout 外部副作用幂等租约与防滥用上限、支付/退款可发现对账队列与持久化认领租约、可恢复退款及财务风险处置、审计目标与数据库不可变守卫、限流数据保留任务、Alembic `0001→0007` 迁移链及敏感正文不落日志的测试覆盖。本机原生 PostgreSQL 已通过迁移、runtime 权限正/负测、审计篡改负测、不同订单并发退款、同订单并发 checkout claim 和账本平衡验证；这仍不是持续压测或真实商户证据。
+已实现（代码与本地验证范围）：注册/登录、邮件验证/密码恢复服务、API Key 摘要保存与吊销、Turnstile hostname/action 服务端绑定、可信代理 IP 边界、测试 HMAC 订单回调幂等、现金支付与服务额度分离的整数双式账本、余额/预算预授权与结算、OpenAI-compatible 非流式与 SSE 流式接口、工具调用字段透传及完整输入安全检查、流式断线/5xx 待对账、供应商受限故障切换、成本台账、输入输出内容安全流式响应上限、运维短令牌、checkout 外部副作用幂等租约与防滥用上限、支付/退款可发现对账队列与持久化认领租约、可恢复退款及财务风险处置、审计目标与数据库不可变守卫、限流数据保留任务、Alembic `0001→0010` 迁移链及敏感正文不落日志的测试覆盖。本机原生 PostgreSQL 已通过迁移、runtime 权限正/负测、审计篡改负测、不同订单并发退款、同订单并发 checkout claim 和账本平衡验证；这仍不是持续压测或真实商户证据。
 
 待验证（外部证据尚未提供）：真实官方供应商联调、各供应商 5xx/usage/计费契约、PostgreSQL 持续并发压测、Redis/边缘限流、正式支付 SDK/证书/商户与小额支付退款对账、SMTP 送达与域名 SPF/DKIM/DMARC、真实域名绑定的 Turnstile site key/secret 与浏览器到服务端二次校验、内容安全和投诉流程、TLS/WAF/KMS、备份恢复演练、真实客户验收以及公网灰度。浏览器 Turnstile 组件及服务端 Siteverify 适配已经实现，但没有真实密钥与域名验收就不算上线证据。
 
@@ -189,13 +189,16 @@ docker compose -f docker-compose.dev.yml up --build
 4. 只有预检通过后，才向 Cloudflare 配置下列 Worker Secrets：
 
 ```text
-KUNLUN_DATABASE_URL=postgresql+psycopg://<runtime role>@<external host>/<database>?sslmode=require
+KUNLUN_DATABASE_URL=postgresql+psycopg://<runtime role>@<external host>/<database>?sslmode=verify-full&sslrootcert=/app/certs/supabase-prod-ca-2021.crt
 KUNLUN_API_KEY_PEPPER=<32+ random printable ASCII characters>
 KUNLUN_SESSION_PEPPER=<different 32+ random printable ASCII characters>
 KUNLUN_TRUSTED_PROXY_SECRET=<different 32+ random printable ASCII characters>
 ```
 
 不要把 migrator URL 注入长期运行的 Worker/Container，也不要把任何真实值写进 `wrangler.jsonc`、GitHub Actions 或仓库文件。
+`0008` 之后的安全迁移要求数据库实际登录角色名精确为 `kunlun_migrator`；其 downgrade 保持权限收紧，不会重新授予 Supabase Data API 角色。生产降级只能在维护窗口、显式破坏性确认和已验证备份下执行。
+
+Supabase 部署镜像内置其公开的 `Supabase Root 2021 CA`，运行时使用 `verify-full` 同时验证 CA 与数据库主机名；证书 SHA-256 指纹为 `80:70:25:AD:50:D4:ED:21:9D:2C:9C:7D:29:9C:00:4F:82:4E:B0:0C:F7:F6:5A:FE:F6:07:D0:7B:72:E6:CA:FA`，有效期至 2031-04-26。替换证书前必须从 Supabase 官方控制台重新下载并复核指纹。
 
 在 Cloudflare 控制台安装 **Cloudflare Workers and Pages** GitHub App 时，只授权本仓库；选择 `main` 为生产分支，构建命令使用 `npm ci && npm run check`，部署命令使用 `npm run deploy`，根目录为仓库根目录。Cloudflare Workers Builds 的生产部署会构建 Dockerfile；非生产分支的 `versions upload` 不会发布 Container 镜像，不能当作完整预览环境。
 

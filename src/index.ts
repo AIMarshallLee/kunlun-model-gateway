@@ -1,6 +1,7 @@
 import { Container, getContainer } from "@cloudflare/containers";
 
 import {
+  deploymentUnavailableResponse,
   missingRequiredBindings,
   prepareContainerRequest,
   publicRouteAllowed,
@@ -60,13 +61,7 @@ const worker = {
 
     const missing = missingRequiredBindings(env);
     if (missing.length > 0) {
-      return Response.json(
-        { error: "deployment_not_configured", missing_bindings: missing },
-        {
-          status: 503,
-          headers: { "Cache-Control": "no-store" },
-        },
-      );
+      return deploymentUnavailableResponse();
     }
 
     const proxySecret = env.KUNLUN_TRUSTED_PROXY_SECRET as string;

@@ -1,19 +1,30 @@
 from __future__ import annotations
 
-from scripts.preflight import _runtime_permission_errors, _trigger_guard_sql
+from pathlib import Path
+
+from scripts.preflight import (
+    AUDIT_TRIGGER_CONTRACT,
+    LEDGER_TRIGGER_CONTRACT,
+    _runtime_permission_errors,
+    _migrator_database_errors,
+    _supabase_rls_errors,
+    _trigger_guard_sql,
+)
 from app.db_guards import ledger_trigger_names, operator_audit_trigger_names
 
 
 def test_trigger_guard_query_covers_every_expected_trigger_and_rejects_disabled():
-    ledger_sql = _trigger_guard_sql(
-        ("ledger_transactions", "ledger_entries"), ledger_trigger_names(), "ledger_guards"
-    )
-    audit_sql = _trigger_guard_sql(("operator_actions",), operator_audit_trigger_names(), "audit_guards")
+    ledger_sql = _trigger_guard_sql(LEDGER_TRIGGER_CONTRACT, "ledger_guards")
+    audit_sql = _trigger_guard_sql(AUDIT_TRIGGER_CONTRACT, "audit_guards")
 
     for name in ledger_trigger_names() + operator_audit_trigger_names():
         assert f"'{name}'" in ledger_sql + audit_sql
-    assert "tgenabled <> 'D'" in ledger_sql
-    assert "tgenabled <> 'D'" in audit_sql
+    assert "t.tgenabled = 'O'" in ledger_sql
+    assert "t.tgtype = expected.trigger_type" in ledger_sql
+    assert "t.tgdeferrable = expected.expected_deferrable" in ledger_sql
+    assert "ledger_entries_balance_deferred" in ledger_sql
+    assert "kunlun_check_ledger_transaction_balance" in ledger_sql
+    assert "function_namespace.nspname = 'public'" in ledger_sql
     assert "COUNT(*) = 5" in ledger_sql
     assert "COUNT(*) = 3" in audit_sql
 
@@ -53,8 +64,15 @@ class _FakeEngine:
         return self.connection
 
 
-def _permission_row(*, ledger_guards=True, audit_guards=True):
-    row = {"current_user": "kunlun_runtime", "ledger_guards": ledger_guards, "audit_guards": audit_guards}
+def _permission_row(*, ledger_guards=True, audit_guards=True, function_search_paths=True):
+    row = {
+        "current_user": "kunlun_runtime",
+        "ledger_guards": ledger_guards,
+        "audit_guards": audit_guards,
+        "function_search_paths": function_search_paths,
+        "runtime_role_safe": True,
+        "runtime_memberships_safe": True,
+    }
     for key in (
         "ledger_select", "ledger_insert", "entry_select", "entry_insert",
         "audit_select", "audit_insert", "version_select",
@@ -78,3 +96,48 @@ def test_runtime_permission_preflight_fails_when_ledger_trigger_is_missing_or_di
     for name in ledger_trigger_names() + operator_audit_trigger_names():
         assert name in rendered
     assert _runtime_permission_errors(_FakeEngine(_permission_row(audit_guards=False)), "kunlun_runtime")
+    assert _runtime_permission_errors(
+        _FakeEngine(_permission_row(function_search_paths=False)), "kunlun_runtime"
+    )
+    for key in ("runtime_role_safe", "runtime_memberships_safe"):
+        row = _permission_row()
+        row[key] = False
+        assert _runtime_permission_errors(_FakeEngine(row), "kunlun_runtime")
+
+
+def test_supabase_rls_preflight_checks_every_table_and_api_role_boundary():
+    good = {
+        "rls_enabled": True,
+        "policy_contract": True,
+        "ordinary_privileges": True,
+        "api_grants_locked": True,
+        "api_policies_locked": True,
+    }
+    engine = _FakeEngine(good)
+    assert _supabase_rls_errors(engine) == []
+    rendered = engine.connection.statement
+    assert "pg_policies" in rendered
+    assert "policyname = 'kunlun_runtime_all_' || tablename" in rendered
+    assert "ordinary_privileges" in rendered
+    assert "aclexplode" in rendered
+    assert "acl.grantee = 0" in rendered
+    assert "anon" in rendered and "authenticated" in rendered
+
+    for key in good:
+        row = dict(good)
+        row[key] = False
+        assert _supabase_rls_errors(_FakeEngine(row))
+
+
+def test_migrator_database_url_requires_independent_verified_tls_connection():
+    ca_path = Path(__file__).resolve().parents[1] / "certs" / "supabase-prod-ca-2021.crt"
+    safe = (
+        "postgresql+psycopg://kunlun_migrator:secret@db.example/postgres"
+        f"?sslmode=verify-full&sslrootcert={ca_path}"
+    )
+    assert _migrator_database_errors(safe, "kunlun_runtime") == []
+    assert _migrator_database_errors(safe, "kunlun_migrator")
+    assert _migrator_database_errors(
+        "postgresql+psycopg://kunlun_migrator:secret@db.example/postgres?sslmode=require",
+        "kunlun_runtime",
+    )

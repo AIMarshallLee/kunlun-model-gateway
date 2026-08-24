@@ -9,12 +9,39 @@ import os
 from pathlib import Path
 import secrets
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 
 TURNSTILE_SITEVERIFY_ENDPOINT = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 SUPPORTED_ENVIRONMENTS = frozenset({"development", "test", "staging", "production"})
 LEGACY_OPERATOR_ENVIRONMENTS = frozenset({"development", "test"})
+
+
+def _production_database_url_is_safe(value: str) -> bool:
+    """Require authenticated PostgreSQL TLS for every production process."""
+    try:
+        parsed = urlparse(value)
+        query = [(key.casefold(), item) for key, item in parse_qsl(
+            parsed.query, keep_blank_values=True,
+        )]
+        ssl_modes = [item.casefold() for key, item in query if key == "sslmode"]
+        root_certs = [item for key, item in query if key == "sslrootcert"]
+        certificate = Path(root_certs[0]) if len(root_certs) == 1 else None
+        return bool(
+            parsed.scheme == "postgresql+psycopg"
+            and parsed.hostname
+            and parsed.username
+            and parsed.password
+            and parsed.path not in {"", "/"}
+            and not parsed.fragment
+            and ssl_modes == ["verify-full"]
+            and certificate is not None
+            and certificate.is_absolute()
+            and certificate.is_file()
+            and os.access(certificate, os.R_OK)
+        )
+    except (TypeError, ValueError, OSError):
+        return False
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -355,8 +382,10 @@ class Settings:
             missing = []
             if self.operator_token:
                 missing.append("KUNLUN_OPERATOR_TOKEN 仅允许在 development/test 环境兼容使用")
-            if self.database_url.startswith("sqlite"):
-                missing.append("PostgreSQL KUNLUN_DATABASE_URL")
+            if not _production_database_url_is_safe(self.database_url):
+                missing.append(
+                    "PostgreSQL KUNLUN_DATABASE_URL（verify-full 与可读的绝对 sslrootcert）"
+                )
             if len(self.api_key_pepper) < 32:
                 missing.append("KUNLUN_API_KEY_PEPPER")
             elif not self.api_key_pepper_persisted:

@@ -98,7 +98,10 @@ class LedgerTransaction(Base):
 
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
-    __table_args__ = (CheckConstraint("amount_microusd != 0", name="ledger_entry_nonzero"),)
+    __table_args__ = (
+        CheckConstraint("amount_microusd != 0", name="ledger_entry_nonzero"),
+        Index("ix_ledger_entries_transaction_user", "transaction_id", "user_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     transaction_id: Mapped[str] = mapped_column(ForeignKey("ledger_transactions.id", ondelete="RESTRICT"), index=True)
@@ -225,7 +228,9 @@ class ModelRequest(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
     api_key_id: Mapped[str] = mapped_column(ForeignKey("api_keys.id", ondelete="RESTRICT"), index=True)
-    budget_id: Mapped[str | None] = mapped_column(ForeignKey("budgets.id", ondelete="RESTRICT"), nullable=True)
+    budget_id: Mapped[str | None] = mapped_column(
+        ForeignKey("budgets.id", ondelete="RESTRICT"), nullable=True, index=True,
+    )
     idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     requested_model: Mapped[str] = mapped_column(String(120))
     final_model: Mapped[str | None] = mapped_column(String(120), nullable=True)

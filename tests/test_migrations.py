@@ -138,6 +138,50 @@ def test_payment_reconciliation_claim_migration_is_chained():
     assert "reconciliation_claim_started_at" in source
 
 
+def test_supabase_rls_migration_is_explicit_and_chained():
+    source = (ROOT / "alembic" / "versions" / "0008_supabase_rls.py").read_text()
+    assert 'revision: str = "0008_supabase_rls"' in source
+    assert 'down_revision: Union[str, None] = "0007_payment_reconcile_claim"' in source
+    for table in (
+        "users", "access_sessions", "api_keys", "budgets", "email_verification_tokens",
+        "password_reset_tokens", "ledger_transactions", "payment_orders", "wallets",
+        "ledger_entries", "model_requests", "payment_webhook_events", "rate_limit_counters",
+        "operator_actions", "provider_attempts", "payment_refunds", "safety_audits",
+        "model_prices", "auth_rate_limit_counters", "outbox_events",
+    ):
+        assert f'"{table}"' in source
+    assert "ENABLE ROW LEVEL SECURITY" in source
+    assert "ALL SEQUENCES IN SCHEMA public" not in source
+    assert "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname" in source
+    assert "TO kunlun_runtime" in source
+    assert "FOR SELECT" in source and "FOR INSERT" in source
+    assert "current_user <> 'kunlun_migrator'" in source
+
+
+def test_postgres_function_hardening_is_chained_and_indexed():
+    source = (ROOT / "alembic" / "versions" / "0009_pg_function_hardening.py").read_text()
+    assert 'revision: str = "0009_pg_function_hardening"' in source
+    assert 'down_revision: Union[str, None] = "0008_supabase_rls"' in source
+    assert "SET search_path = pg_catalog, public" in source
+    for function in (
+        "kunlun_reject_ledger_mutation",
+        "kunlun_check_ledger_transaction_balance",
+        "kunlun_reject_operator_action_mutation",
+    ):
+        assert function in source
+    assert "ix_ledger_entries_transaction_user" in source
+    assert "ix_model_requests_budget_id" in source
+
+
+def test_runtime_function_contract_is_chained_and_revokes_public_execute():
+    source = (ROOT / "alembic" / "versions" / "0010_runtime_contract.py").read_text()
+    assert 'revision: str = "0010_runtime_contract"' in source
+    assert 'down_revision: Union[str, None] = "0009_pg_function_hardening"' in source
+    assert "REVOKE ALL PRIVILEGES ON FUNCTION" in source
+    assert "FROM PUBLIC, kunlun_runtime" in source
+    assert "current_user <> 'kunlun_migrator'" in source
+
+
 def test_all_revision_identifiers_fit_alembic_version_column():
     import ast
 

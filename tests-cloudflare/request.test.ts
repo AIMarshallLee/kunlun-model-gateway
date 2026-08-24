@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  deploymentUnavailableResponse,
   missingRequiredBindings,
   prepareContainerRequest,
   publicRouteAllowed,
@@ -84,7 +85,7 @@ describe("missingRequiredBindings", () => {
     expect(
       missingRequiredBindings({
         KUNLUN_DATABASE_URL:
-          "postgresql+psycopg://runtime:secret@db.example/gateway?sslmode=require",
+          "postgresql+psycopg://runtime:secret@db.example/gateway?sslmode=verify-full&sslrootcert=%2Fapp%2Fcerts%2Fsupabase-prod-ca-2021.crt",
         KUNLUN_API_KEY_PEPPER: "a".repeat(32),
         KUNLUN_SESSION_PEPPER: "b".repeat(32),
         KUNLUN_TRUSTED_PROXY_SECRET: "c".repeat(32),
@@ -119,8 +120,11 @@ describe("missingRequiredBindings", () => {
     "postgresql+psycopg://runtime:secret@db.example/?sslmode=require",
     "postgresql+psycopg://runtime:secret@/gateway?sslmode=require",
     "postgresql+psycopg://db.example/gateway?sslmode=require",
+    "postgresql+psycopg://runtime@db.example/gateway?sslmode=verify-full&sslrootcert=%2Fapp%2Fcerts%2Fsupabase-prod-ca-2021.crt",
     "postgresql://runtime:secret@db.example/gateway?sslmode=require",
     "postgresql+psycopg://runtime:secret@db.example/gateway?sslmode=require&sslmode=disable",
+    "postgresql+psycopg://runtime:secret@db.example/gateway?sslmode=verify-full",
+    "postgresql+psycopg://runtime:secret@db.example/gateway?sslmode=verify-full&sslrootcert=%2Ftmp%2Funtrusted.crt",
   ])("rejects unsafe database URL shape %s", (databaseUrl) => {
     expect(
       missingRequiredBindings({
@@ -130,5 +134,14 @@ describe("missingRequiredBindings", () => {
         KUNLUN_TRUSTED_PROXY_SECRET: "c".repeat(32),
       }),
     ).toEqual(["KUNLUN_DATABASE_URL"]);
+  });
+});
+
+describe("deploymentUnavailableResponse", () => {
+  it("does not reveal binding or secret names to public callers", async () => {
+    const response = deploymentUnavailableResponse();
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(await response.json()).toEqual({ error: "service_unavailable" });
   });
 });

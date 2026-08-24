@@ -25,6 +25,7 @@ WORKDIR /app
 COPY requirements-gateway.lock ./
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
+COPY certs/supabase-prod-ca-2021.crt /app/certs/supabase-prod-ca-2021.crt
 COPY --from=builder /wheels/kunlun_model_gateway-0.1.0-py3-none-any.whl /wheels/
 
 RUN python -m pip install -r requirements-gateway.lock \

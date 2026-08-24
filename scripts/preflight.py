@@ -17,13 +17,26 @@ from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.config import Settings
+from app.config import Settings, _production_database_url_is_safe
 from app.db import build_engine
 from app.db_guards import (
+    KUNLUN_BUSINESS_TABLES,
     SCHEMA_HEAD,
     assert_schema_revision,
-    ledger_trigger_names,
-    operator_audit_trigger_names,
+)
+
+
+LEDGER_TRIGGER_CONTRACT = (
+    ("ledger_transactions_no_update", "ledger_transactions", "kunlun_reject_ledger_mutation", 19, False, False),
+    ("ledger_transactions_no_delete", "ledger_transactions", "kunlun_reject_ledger_mutation", 11, False, False),
+    ("ledger_entries_no_update", "ledger_entries", "kunlun_reject_ledger_mutation", 19, False, False),
+    ("ledger_entries_no_delete", "ledger_entries", "kunlun_reject_ledger_mutation", 11, False, False),
+    ("ledger_entries_balance_deferred", "ledger_entries", "kunlun_check_ledger_transaction_balance", 29, True, True),
+)
+AUDIT_TRIGGER_CONTRACT = (
+    ("operator_actions_no_update", "operator_actions", "kunlun_reject_operator_action_mutation", 19, False, False),
+    ("operator_actions_no_delete", "operator_actions", "kunlun_reject_operator_action_mutation", 11, False, False),
+    ("operator_actions_no_truncate", "operator_actions", "kunlun_reject_operator_action_mutation", 34, False, False),
 )
 
 
@@ -32,24 +45,47 @@ def _database_user(url: str) -> str:
     return urlparse(normalized).username or ""
 
 
-def _trigger_guard_sql(tables: tuple[str, ...], names: tuple[str, ...], alias: str) -> str:
-    """Return a fail-closed PostgreSQL check for a complete active trigger set.
+def _trigger_guard_sql(
+    contract: tuple[tuple[str, str, str, int, bool, bool], ...], alias: str,
+) -> str:
+    """Return a fail-closed check for exact trigger bindings and semantics.
 
-    Trigger names are application constants, not user input. Keeping the
-    allow-list here also makes the preflight query auditable and prevents a
-    partially migrated or disabled append-only boundary from passing.
+    PostgreSQL ``tgtype`` is a bit mask covering row/statement timing and
+    INSERT/DELETE/UPDATE/TRUNCATE events.  Every value here is a fixed source
+    constant, never deployment input.
     """
-    literals = ", ".join("'" + name.replace("'", "''") + "'" for name in names)
-    table_literals = ", ".join(
-        "to_regclass('public." + table.replace("'", "''") + "')" for table in tables
+    rows = ", ".join(
+        "(" + ", ".join((
+            "'" + name.replace("'", "''") + "'",
+            "'" + table.replace("'", "''") + "'",
+            "'" + function.replace("'", "''") + "'",
+            str(trigger_type),
+            "true" if deferrable else "false",
+            "true" if initially_deferred else "false",
+        )) + ")"
+        for name, table, function, trigger_type, deferrable, initially_deferred in contract
     )
     return f"""(
-                SELECT COUNT(*) = {len(names)}
-                   FROM pg_trigger
-                  WHERE tgrelid IN ({table_literals})
-                    AND NOT tgisinternal
-                    AND tgenabled <> 'D'
-                    AND tgname IN ({literals})
+                SELECT COUNT(*) = {len(contract)}
+                FROM (VALUES {rows}) AS expected(
+                    trigger_name, table_name, function_name, trigger_type,
+                    expected_deferrable, expected_initially_deferred
+                )
+                JOIN pg_class AS c ON c.relname = expected.table_name
+                JOIN pg_namespace AS n
+                  ON n.oid = c.relnamespace AND n.nspname = 'public'
+                JOIN pg_trigger AS t
+                  ON t.tgrelid = c.oid AND t.tgname = expected.trigger_name
+                JOIN pg_proc AS p
+                  ON p.oid = t.tgfoid AND p.proname = expected.function_name
+                JOIN pg_namespace AS function_namespace
+                  ON function_namespace.oid = p.pronamespace
+                 AND function_namespace.nspname = 'public'
+                WHERE NOT t.tgisinternal
+                  AND t.tgenabled = 'O'
+                  AND t.tgtype = expected.trigger_type
+                  AND t.tgdeferrable = expected.expected_deferrable
+                  AND t.tginitdeferred = expected.expected_initially_deferred
                 ) AS {alias}"""
 
 
@@ -80,8 +116,40 @@ def _runtime_permission_errors(engine, expected_user: str) -> list[str]:
                 has_table_privilege(current_user, 'operator_actions', 'TRUNCATE') AS audit_truncate,
                 has_table_privilege(current_user, 'operator_actions', 'REFERENCES') AS audit_references,
                 has_table_privilege(current_user, 'operator_actions', 'TRIGGER') AS audit_trigger,
-                {_trigger_guard_sql(('ledger_transactions', 'ledger_entries'), ledger_trigger_names(), 'ledger_guards')},
-                {_trigger_guard_sql(('operator_actions',), operator_audit_trigger_names(), 'audit_guards')},
+                {_trigger_guard_sql(LEDGER_TRIGGER_CONTRACT, 'ledger_guards')},
+                {_trigger_guard_sql(AUDIT_TRIGGER_CONTRACT, 'audit_guards')},
+                (
+                    SELECT COUNT(*) = 3
+                    FROM pg_proc AS p
+                    JOIN pg_namespace AS n ON n.oid = p.pronamespace
+                    WHERE n.nspname = 'public'
+                      AND p.proname IN (
+                          'kunlun_reject_ledger_mutation',
+                          'kunlun_check_ledger_transaction_balance',
+                          'kunlun_reject_operator_action_mutation'
+                      )
+                      AND p.proconfig = ARRAY['search_path=pg_catalog, public']::text[]
+                      AND NOT p.prosecdef
+                      AND NOT p.proleakproof
+                      AND pg_get_userbyid(p.proowner) = 'kunlun_migrator'
+                      AND NOT has_function_privilege(current_user, p.oid, 'EXECUTE')
+                ) AS function_search_paths,
+                (
+                    SELECT NOT rolsuper
+                       AND NOT rolcreatedb
+                       AND NOT rolcreaterole
+                       AND NOT rolinherit
+                       AND NOT rolreplication
+                       AND NOT rolbypassrls
+                    FROM pg_roles
+                    WHERE rolname = current_user
+                ) AS runtime_role_safe,
+                NOT EXISTS (
+                    SELECT 1
+                    FROM pg_auth_members AS membership
+                    JOIN pg_roles AS member ON member.oid = membership.member
+                    WHERE member.rolname = current_user
+                ) AS runtime_memberships_safe,
                 has_table_privilege(current_user, 'alembic_version', 'SELECT') AS version_select,
                 has_table_privilege(current_user, 'alembic_version', 'INSERT') AS version_insert,
                 has_table_privilege(current_user, 'alembic_version', 'UPDATE') AS version_update,
@@ -95,7 +163,9 @@ def _runtime_permission_errors(engine, expected_user: str) -> list[str]:
         errors.append("数据库实际 runtime 角色与连接 URL 不一致")
     if not all(row[key] for key in (
         "ledger_select", "ledger_insert", "entry_select", "entry_insert",
-        "audit_select", "audit_insert", "ledger_guards", "audit_guards", "version_select",
+        "audit_select", "audit_insert", "ledger_guards", "audit_guards",
+        "function_search_paths", "runtime_role_safe", "runtime_memberships_safe",
+        "version_select",
     )):
         errors.append("runtime 缺少必要的账本/审计追加、守卫或 schema 读取权限")
     if any(row[key] for key in (
@@ -108,6 +178,146 @@ def _runtime_permission_errors(engine, expected_user: str) -> list[str]:
     )):
         errors.append("runtime 仍持有 schema、历史账本、运维审计或 Alembic 版本修改权限")
     return errors
+
+
+def _supabase_rls_errors(engine) -> list[str]:
+    """Verify that Supabase Data API roles cannot reach Kunlun tables."""
+    protected_tables = (*KUNLUN_BUSINESS_TABLES, "alembic_version")
+    append_only = {"ledger_transactions", "ledger_entries", "operator_actions"}
+    ordinary_tables = tuple(
+        table for table in KUNLUN_BUSINESS_TABLES if table not in append_only
+    )
+    table_literals = ", ".join(
+        "'" + table.replace("'", "''") + "'" for table in protected_tables
+    )
+    ordinary_literals = ", ".join(
+        "'" + table.replace("'", "''") + "'" for table in ordinary_tables
+    )
+    expected_policy_count = len(ordinary_tables) + len(append_only) * 2 + 1
+    with engine.connect() as connection:
+        row = connection.execute(text(f"""
+            SELECT
+                (
+                    SELECT COUNT(*) = {len(protected_tables)}
+                    FROM pg_class AS c
+                    JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public'
+                      AND c.relkind IN ('r', 'p')
+                      AND c.relname IN ({table_literals})
+                      AND c.relrowsecurity
+                ) AS rls_enabled,
+                (
+                    SELECT COUNT(*) = {expected_policy_count}
+                       AND COUNT(*) FILTER (WHERE
+                            permissive = 'PERMISSIVE'
+                            AND roles = ARRAY['kunlun_runtime']::name[]
+                            AND (
+                                (
+                                    tablename IN ({ordinary_literals})
+                                    AND policyname = 'kunlun_runtime_all_' || tablename
+                                    AND cmd = 'ALL'
+                                    AND qual = 'true'
+                                    AND with_check = 'true'
+                                )
+                                OR (
+                                    tablename IN ('ledger_transactions', 'ledger_entries', 'operator_actions')
+                                    AND policyname = 'kunlun_runtime_select_' || tablename
+                                    AND cmd = 'SELECT'
+                                    AND qual = 'true'
+                                    AND with_check IS NULL
+                                )
+                                OR (
+                                    tablename IN ('ledger_transactions', 'ledger_entries', 'operator_actions')
+                                    AND policyname = 'kunlun_runtime_insert_' || tablename
+                                    AND cmd = 'INSERT'
+                                    AND qual IS NULL
+                                    AND with_check = 'true'
+                                )
+                                OR (
+                                    tablename = 'alembic_version'
+                                    AND policyname = 'kunlun_runtime_select_alembic_version'
+                                    AND cmd = 'SELECT'
+                                    AND qual = 'true'
+                                    AND with_check IS NULL
+                                )
+                            )
+                       ) = {expected_policy_count}
+                    FROM pg_policies
+                    WHERE schemaname = 'public'
+                      AND tablename IN ({table_literals})
+                ) AS policy_contract,
+                (
+                    SELECT COUNT(*) = {len(ordinary_tables)}
+                       AND bool_and(
+                            has_table_privilege(
+                                current_user, format('public.%I', table_name), 'SELECT'
+                            )
+                            AND has_table_privilege(
+                                current_user, format('public.%I', table_name), 'INSERT'
+                            )
+                            AND has_table_privilege(
+                                current_user, format('public.%I', table_name), 'UPDATE'
+                            )
+                            AND has_table_privilege(
+                                current_user, format('public.%I', table_name), 'DELETE'
+                            )
+                            AND NOT has_table_privilege(
+                                current_user, format('public.%I', table_name), 'TRUNCATE'
+                            )
+                            AND NOT has_table_privilege(
+                                current_user, format('public.%I', table_name), 'REFERENCES'
+                            )
+                            AND NOT has_table_privilege(
+                                current_user, format('public.%I', table_name), 'TRIGGER'
+                            )
+                       )
+                    FROM unnest(ARRAY[{ordinary_literals}]::text[]) AS table_name
+                ) AS ordinary_privileges,
+                NOT EXISTS (
+                    SELECT 1
+                    FROM pg_class AS c
+                    JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                    CROSS JOIN LATERAL aclexplode(
+                        COALESCE(c.relacl, acldefault('r', c.relowner))
+                    ) AS acl
+                    LEFT JOIN pg_roles AS grantee ON grantee.oid = acl.grantee
+                    WHERE n.nspname = 'public'
+                      AND c.relkind IN ('r', 'p')
+                      AND c.relname IN ({table_literals})
+                      AND (
+                          acl.grantee = 0
+                          OR grantee.rolname IN ('anon', 'authenticated')
+                      )
+                ) AS api_grants_locked,
+                NOT EXISTS (
+                    SELECT 1
+                    FROM pg_policies
+                    WHERE schemaname = 'public'
+                      AND tablename IN ({table_literals})
+                      AND roles && ARRAY['public', 'anon', 'authenticated']::name[]
+                ) AS api_policies_locked
+        """)).mappings().one()
+    errors: list[str] = []
+    if not row["rls_enabled"]:
+        errors.append("Kunlun 业务表或 Alembic 版本表未完整启用 RLS")
+    if not row["policy_contract"]:
+        errors.append("Kunlun runtime RLS 策略与预期契约不一致")
+    if not row["ordinary_privileges"]:
+        errors.append("Kunlun runtime 普通业务表权限与最小权限契约不一致")
+    if not row["api_grants_locked"] or not row["api_policies_locked"]:
+        errors.append("Supabase anon/authenticated 仍可访问 Kunlun 业务表")
+    return errors
+
+
+def _migrator_database_errors(migrator_url: str, runtime_user: str) -> list[str]:
+    if not _production_database_url_is_safe(migrator_url):
+        return [
+            "KUNLUN_MIGRATOR_DATABASE_URL 必须使用 verify-full 与可读的绝对 sslrootcert"
+        ]
+    migrator_user = _database_user(migrator_url)
+    if not migrator_user or migrator_user == runtime_user:
+        return ["migrator 与 runtime 数据库角色必须不同"]
+    return []
 
 
 def main() -> int:
@@ -128,19 +338,16 @@ def main() -> int:
 
     runtime_user = _database_user(settings.database_url)
     migrator_url = os.getenv("KUNLUN_MIGRATOR_DATABASE_URL", "")
-    migrator_user = _database_user(migrator_url) if migrator_url else ""
     if not runtime_user or runtime_user in {"postgres", "kunlun_migrator"}:
         errors.append("KUNLUN_DATABASE_URL 必须使用非 owner 的 runtime 角色")
-    if not migrator_url.startswith(("postgresql://", "postgresql+psycopg://")):
-        errors.append("KUNLUN_MIGRATOR_DATABASE_URL 必须单独配置")
-    elif not migrator_user or migrator_user == runtime_user:
-        errors.append("migrator 与 runtime 数据库角色必须不同")
+    errors.extend(_migrator_database_errors(migrator_url, runtime_user))
 
     if not errors:
         engine = build_engine(settings.database_url)
         try:
             assert_schema_revision(engine, SCHEMA_HEAD)
             errors.extend(_runtime_permission_errors(engine, runtime_user))
+            errors.extend(_supabase_rls_errors(engine))
         except RuntimeError:
             errors.append(f"数据库必须精确位于 Alembic head {SCHEMA_HEAD}")
         except Exception:

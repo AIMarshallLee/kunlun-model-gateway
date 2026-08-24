@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,6 +13,16 @@ from app.config import Settings
 from app.models import ModelPrice
 from app.providers import OpenAICompatibleProvider, build_provider_clients, supports_model
 from gateway import ProviderError
+
+
+CA_PATH = Path(__file__).resolve().parents[1] / "certs" / "supabase-prod-ca-2021.crt"
+
+
+def _production_database_url(user: str = "gateway") -> str:
+    return (
+        f"postgresql+psycopg://{user}:secret@db/gateway"
+        f"?sslmode=verify-full&sslrootcert={CA_PATH}"
+    )
 
 
 def test_production_config_fails_closed_and_accepts_safe_control_plane():
@@ -25,7 +36,7 @@ def test_production_config_fails_closed_and_accepts_safe_control_plane():
 
     settings = Settings.from_env(
         environment="production",
-        database_url="postgresql+psycopg://gateway:secret@db/gateway",
+        database_url=_production_database_url(),
         api_key_pepper="a" * 32,
         session_pepper="b" * 32,
         api_key_pepper_persisted=True,
@@ -36,10 +47,27 @@ def test_production_config_fails_closed_and_accepts_safe_control_plane():
     assert settings.public_signup is False
     assert settings.live_payments is False
 
+    for unsafe_url in (
+        "postgresql+psycopg://gateway:secret@db/gateway",
+        f"postgresql+psycopg://gateway:secret@db/gateway?sslmode=require&sslrootcert={CA_PATH}",
+        "postgresql+psycopg://gateway:secret@db/gateway?sslmode=verify-full&sslrootcert=/missing/ca.crt",
+        f"postgresql://gateway:secret@db/gateway?sslmode=verify-full&sslrootcert={CA_PATH}",
+    ):
+        with pytest.raises(RuntimeError, match="verify-full"):
+            Settings.from_env(
+                environment="production",
+                database_url=unsafe_url,
+                api_key_pepper="a" * 32,
+                session_pepper="b" * 32,
+                api_key_pepper_persisted=True,
+                session_pepper_persisted=True,
+                trusted_proxy_cidrs={"127.0.0.1/32"},
+            )
+
     with pytest.raises(RuntimeError, match="精确"):
         Settings.from_env(
             environment="production",
-            database_url="postgresql+psycopg://gateway:secret@db/gateway",
+            database_url=_production_database_url(),
             api_key_pepper="a" * 32,
             session_pepper="b" * 32,
             api_key_pepper_persisted=True,
@@ -51,7 +79,7 @@ def test_production_config_fails_closed_and_accepts_safe_control_plane():
 def test_production_app_factory_rejects_injected_adapters(monkeypatch):
     settings = Settings(
         environment="production",
-        database_url="postgresql+psycopg://kunlun_runtime:secret@db/gateway",
+        database_url=_production_database_url("kunlun_runtime"),
         api_key_pepper="a" * 32,
         session_pepper="b" * 32,
         api_key_pepper_persisted=True,
@@ -116,7 +144,7 @@ def test_production_public_signup_is_blocked_until_identity_and_content_gates_ex
     with pytest.raises(RuntimeError, match="邮件验证"):
         Settings.from_env(
             environment="production",
-            database_url="postgresql+psycopg://gateway:secret@db/gateway",
+            database_url=_production_database_url(),
             api_key_pepper="a" * 32,
             session_pepper="b" * 32,
             api_key_pepper_persisted=True,
@@ -146,7 +174,7 @@ def test_production_flags_can_pass_only_with_all_adapter_and_private_ops_gates()
     }
     settings = Settings.from_env(
         environment="production",
-        database_url="postgresql+psycopg://kunlun_runtime:secret@db/gateway",
+        database_url=_production_database_url("kunlun_runtime"),
         api_key_pepper="a" * 32,
         session_pepper="b" * 32,
         identity_token_pepper="c" * 32,
@@ -193,7 +221,7 @@ def test_production_flags_can_pass_only_with_all_adapter_and_private_ops_gates()
 def test_production_live_upstream_requires_explicit_catalog_routes_and_costs():
     base = dict(
         environment="production",
-        database_url="postgresql+psycopg://kunlun_runtime:secret@db/gateway",
+        database_url=_production_database_url("kunlun_runtime"),
         api_key_pepper="a" * 32,
         session_pepper="b" * 32,
         api_key_pepper_persisted=True,
@@ -242,7 +270,7 @@ def test_production_live_upstream_requires_explicit_catalog_routes_and_costs():
 def test_production_public_signup_rejects_server_only_or_spoofed_turnstile_config():
     base = dict(
         environment="production",
-        database_url="postgresql+psycopg://kunlun_runtime:secret@db/gateway",
+        database_url=_production_database_url("kunlun_runtime"),
         api_key_pepper="a" * 32,
         session_pepper="b" * 32,
         identity_token_pepper="c" * 32,
@@ -290,7 +318,7 @@ def test_production_public_signup_rejects_server_only_or_spoofed_turnstile_confi
 def test_live_payment_configuration_can_pass_without_test_payment_mode():
     settings = Settings.from_env(
         environment="production",
-        database_url="postgresql+psycopg://kunlun_runtime:secret@db/gateway",
+        database_url=_production_database_url("kunlun_runtime"),
         api_key_pepper="a" * 32,
         session_pepper="b" * 32,
         api_key_pepper_persisted=True,
