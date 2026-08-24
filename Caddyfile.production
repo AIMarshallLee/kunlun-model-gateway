@@ -1,0 +1,25 @@
+{
+    email {$ACME_EMAIL}
+    admin off
+}
+
+{$PUBLIC_DOMAIN} {
+    @private_control path /ops* /metrics
+    respond @private_control 404
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+    }
+    request_body {
+        max_size 2MB
+    }
+    reverse_proxy api:8787 {
+        # The app accepts this private header only from Caddy's fixed /32.
+        # Overwrite rather than append so client-supplied forwarding data
+        # cannot enter the application trust boundary.
+        header_up X-Kunlun-Client-IP {remote_host}
+    }
+}

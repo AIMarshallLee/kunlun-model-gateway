@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>昆仑模型网关｜开发者控制台</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="wordmark" href="/" aria-label="昆仑模型网关首页">
+      <span class="seal">昆</span>
+      <span>昆仑模型网关</span>
+    </a>
+    <div class="env-strip" id="environment-strip" aria-live="polite">读取运行状态…</div>
+  </header>
+
+  <main>
+    <section class="opening" aria-labelledby="page-title">
+      <p class="eyebrow">CONTROLLED MODEL INFRASTRUCTURE / 受控模型基础设施</p>
+      <h1 id="page-title">每一次模型调用，<br><em>先有预算，再有结果。</em></h1>
+      <div class="opening-note">
+        <span>01</span>
+        <p>注册、API Key、服务额度、预算、成本与故障切换在同一条可审计链路中。这里卖的是可控调用，不是共享账号。</p>
+      </div>
+    </section>
+
+    <section class="auth-shell" id="auth-shell" aria-label="账户入口">
+      <div class="auth-intro">
+        <p class="kicker">进入控制面</p>
+        <h2>先验证身份，<br>再触碰额度。</h2>
+        <p>会话只保存在当前页面内存中；刷新页面会自动退出。API Key 只显示一次。</p>
+      </div>
+      <div class="auth-forms">
+        <form id="login-form" class="form-card">
+          <div class="form-heading"><span>登录</span><small>已有账户</small></div>
+          <label>邮箱<input name="email" type="email" autocomplete="username" required></label>
+          <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+          <button type="submit">进入控制台 <span>→</span></button>
+          <button class="text-button" id="forgot-toggle" type="button">忘记密码</button>
+          <div id="forgot-fields" hidden>
+            <label>找回邮箱<input id="forgot-email" type="email" autocomplete="email"></label>
+            <div class="captcha-widget" id="forgot-captcha" hidden aria-label="人机验证"></div>
+            <button id="forgot-submit" type="button">发送重置邮件</button>
+          </div>
+        </form>
+        <form id="register-form" class="form-card form-card-muted">
+          <div class="form-heading"><span>注册</span><small id="signup-state">检查开关中</small></div>
+          <label>邮箱<input name="email" type="email" autocomplete="username" required></label>
+          <label>密码<input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
+          <div class="captcha-widget" id="register-captcha" hidden aria-label="人机验证"></div>
+          <button type="submit">创建账户 <span>＋</span></button>
+          <p class="microcopy">至少 12 位。启用邮箱验证后，必须先点击邮件中的一次性链接。</p>
+          <button class="text-button" id="resend-toggle" type="button">没有收到验证邮件</button>
+          <div id="resend-fields" hidden>
+            <label>注册邮箱<input id="resend-email" type="email" autocomplete="email"></label>
+            <div class="captcha-widget" id="resend-captcha" hidden aria-label="重发邮件人机验证"></div>
+            <button id="resend-submit" type="button">重新发送验证邮件</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section class="auth-shell" id="recovery-shell" hidden aria-label="密码重置">
+      <div class="auth-intro">
+        <p class="kicker">CREDENTIAL ROTATION</p>
+        <h2>重置密码，<br>吊销旧凭证。</h2>
+        <p>完成后，旧网页登录会话和 API Key 会立即失效。</p>
+      </div>
+      <form id="reset-form" class="form-card">
+        <div class="form-heading"><span>设置新密码</span><small>一次性链接</small></div>
+        <label>新密码<input name="new_password" type="password" autocomplete="new-password" minlength="12" required></label>
+        <button type="submit">完成重置 <span>→</span></button>
+      </form>
+    </section>
+
+    <section class="console" id="console" hidden aria-label="开发者控制台">
+      <header class="console-heading">
+        <div>
+          <p class="eyebrow">TENANT CONTROL DESK</p>
+          <h2>账户控制台</h2>
+        </div>
+        <button class="quiet-button" id="logout-button" type="button">退出当前会话</button>
+      </header>
+
+      <div class="metric-grid">
+        <article class="metric metric-primary">
+          <span>可用服务额度</span>
+          <strong id="balance-value">—</strong>
+          <small>microUSD，不可提现</small>
+        </article>
+        <article class="metric">
+          <span>预授权占用</span>
+          <strong id="reserved-value">—</strong>
+          <small>状态不确定时等待对账</small>
+        </article>
+        <article class="metric">
+          <span>当前预算</span>
+          <strong id="budget-value">未设置</strong>
+          <small>阻止新请求继续发出</small>
+        </article>
+        <article class="metric metric-signal">
+          <span>运行模式</span>
+          <strong id="mode-value">—</strong>
+          <small id="provider-value">—</small>
+        </article>
+      </div>
+
+      <div class="work-grid">
+        <article class="panel panel-keys">
+          <div class="panel-title">
+            <div><span>01</span><h3>API Keys</h3></div>
+            <p>密钥只显示一次，后台仅保存摘要。</p>
+          </div>
+          <form id="key-form" class="inline-form">
+            <label><span>用途名称</span><input name="name" maxlength="80" placeholder="例如：OpenCode 主工作区" required></label>
+            <button type="submit">生成新 Key</button>
+          </form>
+          <div class="one-time-secret" id="one-time-secret" hidden>
+            <span>立即复制，关闭后无法找回</span>
+            <code id="secret-value"></code>
+            <button id="hide-secret" type="button">我已保存</button>
+          </div>
+          <div class="record-list" id="key-list" aria-live="polite"></div>
+        </article>
+
+        <article class="panel panel-wallet">
+          <div class="panel-title">
+            <div><span>02</span><h3>额度与充值订单</h3></div>
+            <p>测试支付只验证账务，不代表真实扣款。</p>
+          </div>
+          <form id="topup-form" class="inline-form" hidden>
+            <label><span>测试额度 / microUSD</span><input name="amount" type="number" min="100" max="100000000" value="100000" required></label>
+            <button type="submit">创建测试订单</button>
+          </form>
+          <form id="checkout-form" class="inline-form" hidden>
+            <label><span>正式充值套餐</span><select name="sku" id="package-select" required></select></label>
+            <button type="submit">前往支付</button>
+          </form>
+          <p class="boundary-note" id="payment-boundary">正式支付未启用。真实充值需要支付机构官方适配器与对账。</p>
+          <div class="record-list" id="topup-list"></div>
+        </article>
+
+        <article class="panel panel-budget">
+          <div class="panel-title">
+            <div><span>03</span><h3>月度硬预算</h3></div>
+            <p>额度不足或预算不足时，上游调用数为零。</p>
+          </div>
+          <form id="budget-form" class="inline-form">
+            <label><span>月度上限 / microUSD</span><input name="amount" type="number" min="1" value="1000000" required></label>
+            <button type="submit">设置新预算</button>
+          </form>
+          <div class="record-list" id="budget-list"></div>
+        </article>
+
+        <article class="panel panel-usage">
+          <div class="panel-title">
+            <div><span>04</span><h3>模型成本台账</h3></div>
+            <p>只记录模型、Token、成本与失败类别，不保存正文。</p>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>请求</th><th>状态</th><th>模型 / Provider</th><th>成本</th><th>Token</th></tr></thead>
+              <tbody id="usage-table"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel panel-ledger">
+          <div class="panel-title">
+            <div><span>05</span><h3>不可变余额流水</h3></div>
+            <p>退款和释放均新增反向分录，不改写历史。</p>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>时间</th><th>类型</th><th>业务引用</th><th>变动</th></tr></thead>
+              <tbody id="ledger-table"></tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>Kunlun / 可审计模型调用</span>
+    <span>测试通过 ≠ 公网、支付或合规验收</span>
+  </footer>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

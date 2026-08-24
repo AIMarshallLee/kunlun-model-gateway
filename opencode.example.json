@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "kunlun-gateway": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Kunlun Gateway",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "{env:KUNLUN_GATEWAY_API_KEY}"
+      },
+      "models": {
+        "test-model": {
+          "name": "Kunlun test-model",
+          "limit": {
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+  "model": "kunlun-gateway/test-model"
+}

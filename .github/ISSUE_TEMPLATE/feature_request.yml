@@ -1,0 +1,26 @@
+name: 功能建议
+description: 提议一个可验证、范围清晰的改进
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 说明谁遇到什么问题，以及当前如何处理。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 描述行为、边界和不做事项。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 给出可通过测试或人工检查验证的结果。
+    validations:
+      required: true

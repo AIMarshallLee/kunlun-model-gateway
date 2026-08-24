@@ -1,0 +1,144 @@
+services:
+  postgres:
+    # Pin a published Docker Official Image tag; refresh deliberately after
+    # reviewing the digest, backups and compatibility in a release change.
+    image: postgres:16.15-alpine3.24
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:?set POSTGRES_ADMIN_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?set POSTGRES_ADMIN_PASSWORD}
+      KUNLUN_RUNTIME_DB_PASSWORD: ${KUNLUN_RUNTIME_DB_PASSWORD:?set KUNLUN_RUNTIME_DB_PASSWORD}
+      KUNLUN_MIGRATOR_DB_PASSWORD: ${KUNLUN_MIGRATOR_DB_PASSWORD:?set KUNLUN_MIGRATOR_DB_PASSWORD}
+    volumes:
+      - kunlun-postgres:/var/lib/postgresql/data
+      - ./scripts/init-postgres-roles.sh:/docker-entrypoint-initdb.d/10-kunlun-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+    networks: [kunlun-internal]
+
+  migrate:
+    build: .
+    restart: "no"
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      KUNLUN_DATABASE_URL: ${KUNLUN_MIGRATOR_DATABASE_URL:?set KUNLUN_MIGRATOR_DATABASE_URL}
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    networks: [kunlun-internal]
+
+  preflight:
+    # Do not let API/maintenance start until the runtime role, exact schema
+    # head, append-only triggers and permissions have been checked against the
+    # migrated database. This is a one-shot gate, not a second migrator.
+    build: .
+    restart: "no"
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      KUNLUN_DATABASE_URL: ${KUNLUN_RUNTIME_DATABASE_URL:?set KUNLUN_RUNTIME_DATABASE_URL}
+      KUNLUN_RUNTIME_DATABASE_URL: ${KUNLUN_RUNTIME_DATABASE_URL:?set KUNLUN_RUNTIME_DATABASE_URL}
+      KUNLUN_MIGRATOR_DATABASE_URL: ${KUNLUN_MIGRATOR_DATABASE_URL:?set KUNLUN_MIGRATOR_DATABASE_URL}
+    command: ["kunlun-production-preflight"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    networks: [kunlun-internal]
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      KUNLUN_DATABASE_URL: ${KUNLUN_RUNTIME_DATABASE_URL:?set KUNLUN_RUNTIME_DATABASE_URL}
+    expose: ["8787"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      preflight:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    networks: [kunlun-internal]
+
+  maintenance:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      KUNLUN_DATABASE_URL: ${KUNLUN_RUNTIME_DATABASE_URL:?set KUNLUN_RUNTIME_DATABASE_URL}
+    command: ["python", "-m", "scripts.maintenance", "--interval-seconds", "60"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      preflight:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    networks: [kunlun-internal]
+
+  caddy:
+    # Pin a published Caddy tag; do not use floating `latest` in production.
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?set PUBLIC_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile.production:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      kunlun-internal:
+        ipv4_address: 172.30.50.2
+
+volumes:
+  kunlun-postgres:
+  caddy-data:
+  caddy-config:
+
+networks:
+  kunlun-internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.50.0/24

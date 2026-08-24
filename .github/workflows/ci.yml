@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python 3.12 tests and coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install locked dependencies
+        run: uv sync --locked --extra postgres --extra test --python 3.12
+
+      - name: Run the full test suite with branch coverage
+        run: uv run --python 3.12 coverage run --branch -m pytest
+
+      - name: Enforce coverage threshold
+        run: uv run --python 3.12 coverage report --fail-under=80
+
+      - name: Upload coverage data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-python-3.12
+          path: .coverage
+          if-no-files-found: ignore
+
+  cloudflare:
+    name: Cloudflare Worker checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run TypeScript checks and Worker unit tests
+        run: npm run check
+
+      - name: Validate Worker bundle and Wrangler configuration
+        run: npx wrangler deploy --dry-run --containers-rollout=none --outdir /tmp/kunlun-worker-dry-run

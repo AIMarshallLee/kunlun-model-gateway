@@ -1,0 +1,36 @@
+name: 缺陷报告
+description: 报告可复现的功能或运行缺陷
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先确认没有包含密钥、客户数据、提示词正文、回答正文或支付凭证。安全问题请走 Security Advisory。
+  - type: input
+    id: version
+    attributes:
+      label: 版本或提交
+      description: 填写发布版本或完整 commit SHA。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 提供最小、可重复的步骤和脱敏配置。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期与实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      description: Python 版本、数据库类型、部署方式；不要粘贴密钥。
+    validations:
+      required: true

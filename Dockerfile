@@ -1,0 +1,35 @@
+FROM python:3.12-slim-bookworm AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /src
+COPY requirements-build.lock ./
+RUN python -m pip install -r requirements-build.lock
+
+COPY pyproject.toml ./
+COPY app ./app
+COPY scripts ./scripts
+COPY gateway.py ./gateway.py
+RUN python -m pip wheel --no-deps --no-build-isolation \
+    --wheel-dir /wheels .
+
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+COPY requirements-gateway.lock ./
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini
+COPY --from=builder /wheels/kunlun_model_gateway-0.1.0-py3-none-any.whl /wheels/
+
+RUN python -m pip install -r requirements-gateway.lock \
+    && python -m pip install --no-deps /wheels/kunlun_model_gateway-0.1.0-py3-none-any.whl
+
+USER 10001:10001
+EXPOSE 8787
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8787", "--no-proxy-headers"]

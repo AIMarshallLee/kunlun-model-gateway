@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: kunlun_gateway
+      POSTGRES_USER: kunlun
+      POSTGRES_PASSWORD: kunlun-dev-only-change-me
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kunlun -d kunlun_gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - kunlun-postgres-dev:/var/lib/postgresql/data
+
+  api:
+    build: .
+    environment:
+      KUNLUN_ENV: development
+      KUNLUN_DATABASE_URL: postgresql+psycopg://kunlun:kunlun-dev-only-change-me@postgres:5432/kunlun_gateway
+      KUNLUN_PUBLIC_SIGNUP: "false"
+      KUNLUN_ENABLE_TEST_PAYMENTS: "false"
+      KUNLUN_LIVE_PAYMENTS: "false"
+      KUNLUN_LIVE_UPSTREAM: "false"
+      KUNLUN_RATE_LIMIT_PER_MINUTE: "60"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8787:8787"
+
+volumes:
+  kunlun-postgres-dev:

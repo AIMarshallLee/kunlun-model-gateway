@@ -1,0 +1,3 @@
+# Build-only dependencies. Keep separate from the runtime dependency set.
+setuptools==84.0.0
+wheel==0.48.0
