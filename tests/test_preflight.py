@@ -5,6 +5,7 @@ from pathlib import Path
 from scripts.preflight import (
     AUDIT_TRIGGER_CONTRACT,
     LEDGER_TRIGGER_CONTRACT,
+    _database_user,
     _runtime_permission_errors,
     _migrator_database_errors,
     _supabase_rls_errors,
@@ -141,3 +142,13 @@ def test_migrator_database_url_requires_independent_verified_tls_connection():
         "postgresql+psycopg://kunlun_migrator:secret@db.example/postgres?sslmode=require",
         "kunlun_runtime",
     )
+
+
+def test_preflight_normalizes_only_supavisor_project_qualified_users():
+    assert _database_user(
+        "postgresql+psycopg://kunlun_runtime.oyhavtaalkidrllxfigw:secret@"
+        "aws-0-ca-central-1.pooler.supabase.com:5432/postgres"
+    ) == "kunlun_runtime"
+    assert _database_user(
+        "postgresql+psycopg://role.with.dot:secret@db.example/postgres"
+    ) == "role.with.dot"

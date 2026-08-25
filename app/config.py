@@ -99,6 +99,9 @@ class Settings:
     trusted_proxy_cidrs: set[str] = field(default_factory=set)
     trusted_proxy_secret: str = ""
     trusted_proxy_secret_persisted: bool = False
+    ingress_provider: str = ""
+    cron_secret: str = ""
+    cron_secret_persisted: bool = False
     content_safety_required: bool = False
     content_safety_endpoint: str = ""
     content_safety_api_key: str = ""
@@ -165,6 +168,7 @@ class Settings:
         trusted_proxy_secret, trusted_proxy_secret_persisted = _env_secret(
             "KUNLUN_TRUSTED_PROXY_SECRET"
         )
+        cron_secret, cron_secret_persisted = _env_secret("CRON_SECRET")
         values: dict[str, Any] = {
             "database_url": os.getenv("KUNLUN_DATABASE_URL", "sqlite:///./kunlun-gateway.sqlite3"),
             "environment": os.getenv("KUNLUN_ENV", "development"),
@@ -202,6 +206,9 @@ class Settings:
             },
             "trusted_proxy_secret": trusted_proxy_secret,
             "trusted_proxy_secret_persisted": trusted_proxy_secret_persisted,
+            "ingress_provider": os.getenv("KUNLUN_INGRESS_PROVIDER", ""),
+            "cron_secret": cron_secret,
+            "cron_secret_persisted": cron_secret_persisted,
             "content_safety_required": _env_bool("KUNLUN_CONTENT_SAFETY_REQUIRED"),
             "content_safety_endpoint": os.getenv("KUNLUN_CONTENT_SAFETY_ENDPOINT", ""),
             "content_safety_api_key": safety_key,
@@ -342,6 +349,21 @@ class Settings:
             or any(ord(char) < 33 or ord(char) > 126 for char in self.trusted_proxy_secret)
         ):
             raise RuntimeError("KUNLUN_TRUSTED_PROXY_SECRET 必须是至少 32 字符的可打印 ASCII 密钥")
+        self.ingress_provider = self.ingress_provider.strip().casefold()
+        if self.ingress_provider not in {"", "vercel"}:
+            raise RuntimeError("KUNLUN_INGRESS_PROVIDER 仅支持 vercel")
+        if self.ingress_provider == "vercel":
+            missing_vercel = []
+            if not self.trusted_proxy_secret or not self.trusted_proxy_secret_persisted:
+                missing_vercel.append("持久化 KUNLUN_TRUSTED_PROXY_SECRET")
+            if (
+                len(self.cron_secret) < 32
+                or not self.cron_secret_persisted
+                or any(ord(char) < 33 or ord(char) > 126 for char in self.cron_secret)
+            ):
+                missing_vercel.append("持久化 CRON_SECRET")
+            if missing_vercel:
+                raise RuntimeError("Vercel ingress 配置不完整: " + ", ".join(missing_vercel))
         if self.live_upstream:
             configured_hosts = {
                 (urlparse(str(provider.get("base_url") or "")).hostname or "").casefold()

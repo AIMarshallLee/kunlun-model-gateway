@@ -105,6 +105,8 @@ from .services.live_payments import LivePaymentBridge, PaymentBridgeError
 from .services.payment_domain import PaymentDomainError, PaymentDomainService
 from .services.ops_tokens import OperatorClaims
 from .streaming import SSEUsageTracker, StreamProtocolError, synthesize_sse
+from .vercel import VercelIngressMiddleware
+from scripts.maintenance import run_once as run_maintenance_once
 
 
 logger = logging.getLogger("kunlun_gateway")
@@ -402,6 +404,30 @@ def create_app(
             status_code=200 if report["status"] == "ready" else 503,
             content=report,
         )
+
+    @app.get("/api/cron/maintenance", include_in_schema=False)
+    def maintenance_cron(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        if not settings.cron_secret:
+            raise HTTPException(status_code=404, detail="Not Found")
+        expected = f"Bearer {settings.cron_secret}"
+        if authorization is None or not secrets.compare_digest(authorization, expected):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        counts = run_maintenance_once(settings, app.state.SessionLocal)
+        if counts is None:
+            logger.info("Vercel maintenance cron skipped because the database lock is held")
+            return {
+                "status": "skipped",
+                "deleted_auth_rate_limit_counters": 0,
+                "deleted_rate_limit_counters": 0,
+                "stale_model_reservations": 0,
+            }
+        logger.info("Vercel maintenance cron completed: %s", counts)
+        return {
+            "status": "ok",
+            "deleted_auth_rate_limit_counters": counts["auth_rate_limit_counters"],
+            "deleted_rate_limit_counters": counts["rate_limit_counters"],
+            "stale_model_reservations": counts["stale_model_reservations"],
+        }
 
     @app.get("/metrics", include_in_schema=False)
     def metrics(
@@ -1984,4 +2010,9 @@ def create_app(
         trusted_proxy_cidrs=settings.trusted_proxy_cidrs,
         trusted_proxy_secret=settings.trusted_proxy_secret,
     )
+    if settings.ingress_provider == "vercel":
+        app.add_middleware(
+            VercelIngressMiddleware,
+            proxy_secret=settings.trusted_proxy_secret,
+        )
     return app

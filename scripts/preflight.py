@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import sys
 from urllib.parse import urlparse
 
@@ -42,7 +43,14 @@ AUDIT_TRIGGER_CONTRACT = (
 
 def _database_user(url: str) -> str:
     normalized = url.replace("postgresql+psycopg://", "postgresql://", 1)
-    return urlparse(normalized).username or ""
+    parsed = urlparse(normalized)
+    username = parsed.username or ""
+    hostname = (parsed.hostname or "").casefold()
+    if hostname.endswith(".pooler.supabase.com"):
+        role, separator, project_ref = username.rpartition(".")
+        if separator and role and re.fullmatch(r"[a-z0-9]{20}", project_ref):
+            return role
+    return username
 
 
 def _trigger_guard_sql(

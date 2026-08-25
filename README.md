@@ -103,6 +103,8 @@ export KUNLUN_GATEWAY_API_KEY='仅粘贴创建时显示一次的 gw_... Key'
 | `KUNLUN_PUBLIC_BASE_URL` | 空 | 公开站点的 HTTPS 根地址；支付 `return_url` 必须与它同源 |
 | `KUNLUN_TRUSTED_PROXY_CIDRS` | 空 | 生产必须显式配置可信反向代理；内置 compose 只信任固定 Caddy `172.30.50.2/32`，其余来源的转发头被忽略 |
 | `KUNLUN_TRUSTED_PROXY_SECRET` | 空 | Cloudflare Worker → Container 的共享代理密钥；至少 32 个可打印 ASCII 字符，只能通过 Worker Secret 注入，应用验证后会删除内部请求头 |
+| `KUNLUN_INGRESS_PROVIDER` | 空 | Vercel 容器部署显式设为 `vercel`；适配层只使用 Vercel 覆盖后的客户端 IP 头，并删除调用方提交的转发头 |
+| `CRON_SECRET` | 空 | Vercel Cron 的独立 32+ 字符 Bearer 密钥；不得与代理密钥或 Pepper 复用 |
 | `KUNLUN_OPERATOR_SIGNING_SECRET` | 空 | 生产运维短令牌签名密钥；通过 `scripts/mint_ops_token.py` 颁发最小 scope、短 TTL Token |
 | `KUNLUN_PROVIDERS_JSON` | `[]` | 供应商名称、base_url、api_key_env、models、超时；不放密钥正文 |
 | `KUNLUN_PROVIDER_HOST_ALLOWLIST` | 空 | 开启真实上游前必须列出精确 Provider hostname；生产还需固定出口网络策略 |
@@ -211,6 +213,30 @@ npx wrangler deploy
 ```
 
 如果本机没有 Docker，只能用 `npx wrangler deploy --dry-run --containers-rollout=none` 检查 Worker bundle；这不构建 Container，也不是部署证据。首次部署后还必须实测 `/healthz`、`/readyz`、受保护接口、编码后的私有路径、Container 休眠重启、Cron maintenance、账本持久性和数据库恢复。Workers Builds、Secrets、域名、WAF 与 PostgreSQL 均属账户侧配置，单纯推送 GitHub 不代表 Cloudflare 已上线。
+
+## GitHub → Vercel Container
+
+Vercel 路径使用仓库根目录的 `Dockerfile.vercel`，保留原 FastAPI、非 root 用户和 Supabase CA，并通过平台提供的 `$PORT` 启动。`vercel.json` 把函数固定在 Montréal `yul1`，并每五分钟调用一次受 `CRON_SECRET` 保护的 `/api/cron/maintenance`。该频率和商业用途要求 Vercel Pro 或更高计划；Hobby 不能作为本产品的商业上线环境。
+
+Vercel Functions 当前不能直接访问 Supabase 默认的 IPv6 数据库端点，因此长期 Runtime 连接应使用项目 Connect 面板提供的 IPv4 Supavisor **session pooler** URL。URL 用户名形如 `kunlun_runtime.PROJECT_REF`，仍须使用 `postgresql+psycopg`、`sslmode=verify-full` 和镜像内绝对 CA 路径。数据库迁移继续通过外部一次性 `kunlun_migrator` 直连执行；严禁把 migrator URL 放进 Vercel。
+
+Vercel 项目最小生产变量：
+
+```text
+KUNLUN_ENV=production
+KUNLUN_DATABASE_URL=<Supavisor session runtime URL with verify-full CA>
+KUNLUN_PUBLIC_SIGNUP=false
+KUNLUN_ENABLE_TEST_PAYMENTS=false
+KUNLUN_LIVE_PAYMENTS=false
+KUNLUN_LIVE_UPSTREAM=false
+KUNLUN_API_KEY_PEPPER=<32+ random printable ASCII characters>
+KUNLUN_SESSION_PEPPER=<different 32+ random printable ASCII characters>
+KUNLUN_TRUSTED_PROXY_SECRET=<different 32+ random printable ASCII characters>
+KUNLUN_INGRESS_PROVIDER=vercel
+CRON_SECRET=<different 32+ random printable ASCII characters>
+```
+
+Vercel ingress 会阻断公网 `/ops`、`/ops/*` 与 `/metrics`（包含重复 URL 编码、反斜线和点路径变体），覆盖调用方提交的代理头，并把 Vercel 防伪后的客户端 IP 转换成应用现有的私有代理契约。生产部署后必须实测数据库连通性、schema head、私有路径、Cron 401/200、冷启动、流式响应与重部署后的账本持久性；部署成功本身不等于真实模型、支付或客户验收。
 
 ## 部署、迁移与回滚
 

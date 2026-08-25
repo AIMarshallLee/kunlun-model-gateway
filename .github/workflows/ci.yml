@@ -65,3 +65,26 @@ jobs:
 
       - name: Validate Worker bundle and Wrangler configuration
         run: npx wrangler deploy --dry-run --containers-rollout=none --outdir /tmp/kunlun-worker-dry-run
+
+  vercel-container:
+    name: Vercel container build and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Build the Vercel container image
+        run: docker build --file Dockerfile.vercel --tag kunlun-vercel-smoke .
+
+      - name: Start the image and verify HTTP health
+        run: |
+          docker run --detach --name kunlun-vercel-smoke \
+            --publish 127.0.0.1:18080:8080 \
+            --env PORT=8080 \
+            --env KUNLUN_DATABASE_URL=sqlite:////tmp/kunlun-vercel-smoke.sqlite3 \
+            kunlun-vercel-smoke
+          trap 'docker logs kunlun-vercel-smoke; docker rm --force kunlun-vercel-smoke' EXIT
+          curl --fail --retry 20 --retry-delay 1 --retry-all-errors \
+            http://127.0.0.1:18080/healthz
+          curl --fail http://127.0.0.1:18080/readyz
