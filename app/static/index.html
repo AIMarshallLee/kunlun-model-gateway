@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>昆仑模型网关｜开发者控制台</title>
   <link rel="stylesheet" href="/assets/styles.css">
-  <script src="/assets/app.js" defer></script>
+  <script src="/assets/app.js" type="module"></script>
 </head>
 <body>
   <header class="masthead">
@@ -150,6 +150,15 @@
             <button type="submit">前往支付</button>
           </form>
           <p class="boundary-note" id="payment-boundary">正式支付未启用。真实充值需要支付机构官方适配器与对账。</p>
+          <div id="checkout-recovery" hidden>
+            <p class="boundary-note">超时不代表订单未创建。保留原编号并查询，勿重复付款。刷新或返回本站后需要重新登录，可从订单列表恢复；网页返回不能确认入账。</p>
+            <p>购买请求编号：<code id="checkout-request-id"></code></p>
+            <pre id="checkout-result" class="boundary-note" aria-live="polite"></pre>
+            <a id="resume-checkout" hidden rel="noreferrer">继续原订单支付 ↗</a>
+            <button id="lookup-checkout" type="button">查询原购买请求</button>
+            <button id="new-checkout" type="button">已核对，开始另一笔购买</button>
+          </div>
+          <button id="refresh-orders" type="button">刷新订单与余额</button>
           <div class="record-list" id="topup-list"></div>
         </article>
 

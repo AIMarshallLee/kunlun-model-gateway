@@ -1,4 +1,5 @@
 "use strict";
+import {createCheckoutFlow, checkoutDestination} from "./checkout.js";
 
 (() => {
 const state = {
@@ -12,6 +13,7 @@ const state = {
   testIdempotency: "",
 };
 const byId = (id) => document.getElementById(id);
+const checkout = createCheckoutFlow(api, window.location.origin);
 
 function loadTurnstile() {
   if (window.turnstile) return Promise.resolve(window.turnstile);
@@ -75,12 +77,18 @@ function errorMessage(body, status) {
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (options.auth !== false && state.token) headers.Authorization = `Bearer ${state.token}`;
-  const response = await fetch(path, {
-    method: options.method || "GET",
-    headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
-  });
-  const body = response.status === 204 ? null : await response.json().catch(() => null);
+  const controller = options.timeoutMs ? new AbortController() : null;
+  const timer = controller ? window.setTimeout(() => controller.abort(), options.timeoutMs) : null;
+  let response, body;
+  try {
+    response = await fetch(path, {
+      method: options.method || "GET",
+      headers,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: controller?.signal,
+    });
+    body = response.status === 204 ? null : await response.json().catch(() => null);
+  } finally { if (timer !== null) window.clearTimeout(timer); }
   if (!response.ok) throw new Error(errorMessage(body, response.status));
   return body;
 }
@@ -174,8 +182,9 @@ async function loadReady() {
     }));
   }
   const flags = [
+    state.ready.environment === "production" ? "生产配置（不等于上线验收）" : "测试环境（不接受真实付款）",
     state.ready.public_signup ? "注册开启" : "注册关闭",
-    state.ready.live_payments ? "正式支付" : (state.ready.test_payments ? "测试支付" : "支付关闭"),
+    state.ready.live_payments ? (state.ready.environment === "production" ? "支付已配置" : "模拟支付桥接") : (state.ready.test_payments ? "测试支付" : "支付关闭"),
     byok ? "客户自带模型账号" : (state.ready.live_upstream ? "真实上游" : "上游关闭"),
   ];
   byId("environment-strip").textContent = flags.join(" / ");
@@ -199,11 +208,13 @@ async function loadReady() {
     const options = data.packages.map((item) => {
       const option = document.createElement("option");
       option.value = item.sku;
-      option.textContent = `${item.sku} · ${item.payment_amount_minor} ${item.payment_currency} → ${amount(item.credit_amount_microusd)}`;
+      option.textContent = `${item.sku} · ${item.payment_amount_minor} ${item.payment_currency}（最小货币单位） → ${amount(item.credit_amount_microusd)}`;
       return option;
     });
     byId("package-select").replaceChildren(...options);
-    byId("payment-boundary").textContent = "现金金额与服务额度分别记账；支付由正式桥接服务验签并异步入账。";
+    byId("payment-boundary").textContent = state.ready.environment === "production"
+      ? "现金金额与服务额度分别记账；支付回调验签并确认后入账。网页返回不代表支付成功。"
+      : "仅模拟支付验收，不接受真实款项。测试适配器不能证明正式支付可用。";
   }
 }
 
@@ -225,7 +236,9 @@ async function loadKeys() {
 }
 
 async function loadBalanceAndLedger() {
+  const token = state.token;
   const [wallet, ledger] = await Promise.all([api("/billing/balance"), api("/billing/ledger")]);
+  if (token !== state.token) return;
   byId("balance-value").textContent = amount(wallet.balance);
   byId("reserved-value").textContent = amount(wallet.reserved);
   const body = byId("ledger-table");
@@ -249,12 +262,20 @@ async function loadBalanceAndLedger() {
 }
 
 async function loadTopups() {
+  const token = state.token;
   const data = await api("/billing/topups");
+  if (token !== state.token) return;
   const target = byId("topup-list");
   if (!data.orders.length) return empty(target, "暂无充值订单。");
   target.replaceChildren(...data.orders.map((item) => record(
     `${amount(item.credit_amount_microusd ?? item.amount)} · ${item.status}`,
-    `${item.payment_amount_minor ? `${item.payment_amount_minor} ${item.payment_currency} · ` : ""}${item.payment_mode} · ${dateTime(item.created_at)}`,
+    `${item.id} · ${item.payment_amount_minor ? `${item.payment_amount_minor} ${item.payment_currency}（最小货币单位） · ` : ""}${item.payment_mode} · ${dateTime(item.created_at)}`,
+    "查询 / 恢复", async () => {
+      try {
+        const order = await api(`/billing/topups/${encodeURIComponent(item.id)}`, {timeoutMs: 25000});
+        if (token === state.token) showCheckoutOrder(order, false);
+      } catch (error) { if (token === state.token) showToast(error.message); }
+    },
   )));
 }
 
@@ -411,6 +432,8 @@ async function logout() {
     state.token = "";
     state.testKey = "";
     state.testIdempotency = "";
+    checkout.clear();
+    clearCheckoutDisplay();
     byId("model-test-result").textContent = "";
     byId("request-detail").textContent = "";
     byId("lookup-test").hidden = true;
@@ -478,19 +501,70 @@ byId("topup-form").addEventListener("submit", async (event) => {
   } catch (error) { showToast(error.message); }
 });
 
+function clearCheckoutDisplay() {
+  byId("checkout-recovery").hidden = true;
+  byId("checkout-result").textContent = "";
+  byId("checkout-request-id").textContent = "";
+  byId("resume-checkout").hidden = true;
+  byId("resume-checkout").removeAttribute("href");
+  [byId("checkout-form").querySelector("button"), byId("lookup-checkout"), byId("new-checkout")].forEach((button) => {button.disabled = false;});
+}
+
+function showCheckoutOrder(order, currentRequest = true) {
+  byId("checkout-recovery").hidden = false;
+  const guidance = {
+    resume_checkout: "订单等待付款。仅在确认未支付后继续原订单；付款后等待确认入账。",
+    wait_and_query: "支付会话仍在创建，请稍后查询，不要重复购买。",
+    check_balance: "本站已确认入账，请刷新余额与账本核对。",
+    review_order: "请核对订单、余额和退款记录，再决定是否新购。",
+    contact_support: "状态需要人工核对，请将订单编号提供给支持人员。",
+  };
+  const destination = checkoutDestination(order);
+  byId("checkout-result").textContent = `订单：${order.id}\n状态：${order.status}\n现金：${order.payment_amount_minor ?? "—"} ${order.payment_currency || ""}（最小货币单位）\n服务额度：${amount(order.credit_amount_microusd)}\n${guidance[order.next_action] || (destination ? guidance.resume_checkout : guidance.contact_support)}`;
+  const link = byId("resume-checkout");
+  link.hidden = !destination;
+  if (destination) link.href = destination;
+  else link.removeAttribute("href");
+  byId("checkout-request-id").textContent = currentRequest ? checkout.snapshot.key : "—（按订单编号查询）";
+  byId("lookup-checkout").hidden = !currentRequest || !checkout.snapshot.key;
+}
+
+async function runCheckout(operation) {
+  if (checkout.snapshot.busy) return;
+  const token = state.token;
+  const buttons = [byId("checkout-form").querySelector("button"), byId("lookup-checkout"), byId("new-checkout")];
+  buttons.forEach((button) => {button.disabled = true;});
+  byId("resume-checkout").hidden = true;
+  byId("resume-checkout").removeAttribute("href");
+  try {
+    const pending = operation();
+    byId("checkout-recovery").hidden = false;
+    byId("checkout-request-id").textContent = checkout.snapshot.key;
+    byId("checkout-result").textContent = "正在处理原购买请求…";
+    const order = await pending;
+    if (token !== state.token) return;
+    showCheckoutOrder(order);
+    await Promise.all([loadTopups(), loadBalanceAndLedger()]);
+  } catch (error) {
+    if (token === state.token) {
+      byId("checkout-result").textContent = `${error.message}\n请保留原请求编号并查询。未找到或超时不代表未创建；不要自动改用新编号购买。`;
+      byId("lookup-checkout").hidden = !checkout.snapshot.key;
+    }
+  } finally { if (token === state.token) buttons.forEach((button) => {button.disabled = false;}); }
+}
+
 byId("checkout-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const data = formData(event.currentTarget);
-  try {
-    const idempotencyKey = window.crypto.randomUUID();
-    const order = await api("/billing/checkout", {
-      method: "POST",
-      headers: { "Idempotency-Key": idempotencyKey },
-      body: { sku: data.sku, return_url: `${window.location.origin}/console` },
-    });
-    window.location.assign(order.checkout_url);
-  } catch (error) { showToast(error.message); }
+  await runCheckout(() => checkout.start(data.sku));
 });
+
+byId("lookup-checkout").addEventListener("click", () => runCheckout(() => checkout.lookup()));
+byId("new-checkout").addEventListener("click", () => {
+  if (!window.confirm("这不会取消原订单。请先确认原订单未支付或已处理；继续可能产生另一笔独立购买。确认？")) return;
+  try { checkout.forget(); clearCheckoutDisplay(); } catch (error) { showToast(error.message); }
+});
+byId("refresh-orders").addEventListener("click", () => Promise.all([loadTopups(), loadBalanceAndLedger()]).catch((error) => showToast(error.message)));
 
 byId("forgot-toggle").addEventListener("click", () => {
   if (state.ready?.gateway_mode === "byok") return showToast("请联系交付负责人，核验身份后签发一次性恢复链接。");

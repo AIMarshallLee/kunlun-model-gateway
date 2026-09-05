@@ -30,7 +30,7 @@ from .auth import Principal, enforce_auth_rate_limit, require_api_key, require_o
 from .config import Settings
 from .customer_delivery import router as delivery_router, recorded_request_response
 from .managed_gateway import router as managed_router
-from .public_site import router as public_router
+from .public_site import router as public_router, public_https_url
 from .services import request_limits
 from .services.platform_credentials import SupabasePlatformVault
 from .client_ip import TrustedProxyClientIPMiddleware
@@ -463,6 +463,7 @@ def create_app(
             checks["credential_vault"] = bool(app.state.platform_vault.probe())
         report = readiness_report(checks)
         report.update({
+            "environment": settings.environment,
             "public_signup": settings.public_signup,
             "test_payments": settings.enable_test_payments,
             "live_payments": settings.live_payments or app.state.live_payment_bridge is not None,
@@ -1191,6 +1192,47 @@ def create_app(
             "payment_mode": item.provider,
             "created_at": item.created_at.isoformat(),
         } for item in records]}
+
+    def customer_order_snapshot(user_id: str, criterion) -> JSONResponse:
+        # Recovery only reads our order snapshot. It never creates a payment
+        # intent, calls a supplier, or interprets a browser redirect as payment.
+        with app.state.SessionLocal() as session:
+            order = session.scalar(select(PaymentOrder).where(
+                PaymentOrder.user_id == user_id, criterion,
+            ))
+            if order is None:
+                raise HTTPException(404, "订单未找到；原请求可能仍在途中，请勿改用新编号自动重试")
+            checkout_url = public_https_url(order.checkout_url) if order.status == "pending" else None
+            action = "contact_support"
+            if checkout_url:
+                action = "resume_checkout"
+            elif order.status == "checkout_requesting":
+                action = "wait_and_query"
+            elif order.status == "paid":
+                action = "check_balance"
+            elif order.status in ("closed", "refunded", "expired", "failed"):
+                action = "review_order"
+            return JSONResponse({
+                "id": order.id, "status": order.status, "next_action": action,
+                "checkout_url": checkout_url,
+                "payment_amount_minor": order.payment_amount_minor,
+                "payment_currency": order.payment_currency,
+                "credit_amount_microusd": order.credit_amount_microusd,
+                "created_at": order.created_at.isoformat(),
+            }, headers={"Cache-Control": "no-store"})
+
+    @app.post("/billing/checkout/lookup")
+    def lookup_customer_checkout(
+        principal: Principal = Depends(require_session),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> JSONResponse:
+        if not idempotency_key or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", idempotency_key):
+            raise HTTPException(422, "必须提供有效的 Idempotency-Key")
+        return customer_order_snapshot(principal.user_id, PaymentOrder.client_idempotency_key == idempotency_key)
+
+    @app.get("/billing/topups/{order_id}")
+    def customer_order_detail(order_id: str, principal: Principal = Depends(require_session)) -> JSONResponse:
+        return customer_order_snapshot(principal.user_id, PaymentOrder.id == order_id)
 
     @app.get("/billing/ledger")
     def ledger(principal: Principal = Depends(require_session)) -> dict[str, Any]:

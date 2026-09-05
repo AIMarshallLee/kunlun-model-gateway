@@ -44,8 +44,13 @@ def test_developer_console_has_security_headers_and_no_inline_credentials(client
     assert script.text.count(consume) == 1
     assert script.text.index(consume) < script.text.index("loadReady()")
     assert "captcha_required && !isIdentityRoute" in script.text
-    assert script.text.startswith('"use strict";\n\n(() => {')
+    assert '<script src="/assets/app.js" type="module"></script>' in page.text
+    assert script.text.startswith('"use strict";\nimport {createCheckoutFlow, checkoutDestination} from "./checkout.js";\n\n(() => {\nconst state = {')
     assert script.text.rstrip().endswith("})();")
+    assert "export " not in script.text
+    module = client.get("/assets/checkout.js").text
+    for forbidden in ("localStorage", "sessionStorage", "document.cookie", "window.location", "fetch("):
+        assert forbidden not in module
 
 
 def test_turnstile_widget_uses_public_site_key_and_exact_csp(tmp_path, monkeypatch):

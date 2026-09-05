@@ -60,5 +60,5 @@ def test_public_policy_links_reject_non_https_and_embedded_credentials(managed):
 
 
 def test_checkout_returns_to_console_not_marketing_home(managed):
-    script = managed[0].get("/assets/app.js").text
-    assert 'return_url: `${window.location.origin}/console`' in script
+    script = managed[0].get("/assets/checkout.js").text
+    assert 'return_url: `${origin}/console`' in script

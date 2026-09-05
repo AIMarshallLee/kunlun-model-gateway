@@ -245,12 +245,17 @@ input:focus { border-bottom: 3px solid var(--signal); padding-bottom: 11px; }
 .one-time-secret code { display: block; padding: 12px; overflow-wrap: anywhere; color: #fff; background: rgba(0,0,0,.22); }
 .one-time-secret button { margin-top: 12px; border: 0; border-bottom: 1px solid var(--paper); color: var(--paper); background: transparent; }
 .boundary-note { padding: 15px 17px; border-left: 5px solid var(--signal); background: var(--paper-deep); line-height: 1.55; }
+#checkout-recovery { margin-block: 18px; }
+#checkout-request-id { overflow-wrap: anywhere; }
+#checkout-recovery button, #refresh-orders, #resume-checkout { margin: 6px 8px 6px 0; padding: 9px 12px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); font: inherit; font-size: 13px; }
+#resume-checkout { display: inline-block; border-color: var(--signal); color: var(--signal); }
+#resume-checkout[hidden] { display: none; }
 
 .record-list { display: grid; gap: 1px; background: var(--line); }
 .record { display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: center; padding: 14px 16px; background: var(--paper); }
 .record strong, .record small { display: block; }
 .record strong { overflow-wrap: anywhere; }
-.record small { margin-top: 3px; color: var(--muted); }
+.record small { margin-top: 3px; color: var(--muted); overflow-wrap: anywhere; }
 .record button { border: 0; border-bottom: 1px solid var(--signal); color: var(--signal); background: transparent; }
 .empty { padding: 18px; color: var(--muted); background: var(--paper); }
 
