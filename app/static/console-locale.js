@@ -79,6 +79,8 @@ export const translations = {
   "创建测试订单": "Create test order",
   "正式充值套餐": "Purchase package",
   "前往支付": "Create checkout",
+  "新购买暂不可用。已有订单、余额与对账仍可查询；不要重复付款。": "New purchases are temporarily unavailable. Existing orders, balances and reconciliation remain accessible; do not pay twice.",
+  "购买暂不可用：当前没有已配置的上架模型供给。已有订单仍可查询与对账。": "Purchasing is paused: no listed model has configured supply. Existing orders remain available for lookup and reconciliation.",
   "正式支付未启用。真实充值需要支付机构官方适配器与对账。": "Live payments are disabled. Real purchases require a verified payment integration and reconciliation.",
   "超时不代表订单未创建。保留原编号并查询，勿重复付款。刷新或返回本站后需要重新登录，可从订单列表恢复；网页返回不能确认入账。": "A timeout does not mean no order was created. Keep the original request ID and check before paying again. After returning or refreshing, sign in and recover from the order list. A redirect is not payment confirmation.",
   "购买请求编号：": "Purchase request ID: ",

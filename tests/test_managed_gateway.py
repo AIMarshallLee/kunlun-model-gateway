@@ -297,6 +297,8 @@ def test_managed_checkout_verified_event_and_full_refund_domain(managed):
     """Injected synthetic payment protocol, NOT an official SDK or real cash proof."""
     from app.services.live_payments import CheckoutResult, WebhookResult, RefundResult, PaymentBridgeError
     client, auth, _key, _ops, _calls = managed
+    client.app.state.platform_vault.write(provider="openai", secret="inert-checkout-supply", operation_id="checkout-supply",
+                                          actor="test", reason="synthetic supply for payment acceptance")
     class SimulatedCheckout:
         order_id = ""
         creates = 0

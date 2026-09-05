@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from uuid import uuid4
 
 import pytest
 import uvicorn
@@ -32,6 +33,9 @@ if __name__ == "__main__":
         fixture = managed.__wrapped__(Path(directory), patch)
         client, *_ = next(fixture)
         app = client.app
+        if "--no-supply" not in sys.argv:
+            app.state.platform_vault.write(provider="openai", secret="inert-browser-supply", operation_id="browser-supply",
+                                            actor="fixture", reason="synthetic checkout supply")
         bridge = BrowserPaymentBridge()
         app.state.live_payment_bridge = bridge
         app.state.settings.payment_provider = "simulated_checkout"
@@ -43,6 +47,12 @@ if __name__ == "__main__":
         @app.get("/__fixture__/payment-calls")
         def payment_calls():
             return {"count": len(bridge.checkout_calls)}
+
+        @app.post("/__fixture__/supply/{enabled}")
+        def synthetic_supply(enabled: bool):
+            app.state.platform_vault.write(provider="openai", secret="inert-browser-supply" if enabled else None,
+                operation_id=str(uuid4()), actor="fixture", reason="synthetic outage acceptance")
+            return {"enabled": enabled}
 
         @app.get("/__fixture__/latest-token")
         def latest_token(email: str, kind: str):

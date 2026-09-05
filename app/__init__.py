@@ -33,6 +33,7 @@ from .managed_gateway import router as managed_router
 from .public_site import router as public_router, public_https_url
 from .services import request_limits
 from .services.platform_credentials import SupabasePlatformVault
+from .services.purchase_supply import has_configured_supply
 from .client_ip import TrustedProxyClientIPMiddleware
 from .db import Base, build_engine, build_session_factory, install_ledger_guards
 from .db_guards import SCHEMA_HEAD, assert_schema_revision
@@ -1006,7 +1007,10 @@ def create_app(
 
     @app.get("/billing/packages")
     def live_payment_packages() -> dict[str, Any]:
-        return {"packages": [{
+        purchasing_enabled = bool(app.state.live_payment_bridge is not None and settings.payment_provider
+            and settings.topup_packages and (settings.gateway_mode != "managed_gateway" or
+                has_configured_supply(settings, app.state.platform_vault, app.state.SessionLocal)))
+        return {"purchasing_enabled": purchasing_enabled, "packages": [{
             "sku": sku,
             "payment_amount_minor": int(package["payment_amount_minor"]),
             "payment_currency": str(package["payment_currency"]),
@@ -1049,6 +1053,10 @@ def create_app(
             principal.user_id,
             settings.checkout_rate_limit_per_minute,
         )
+        if settings.gateway_mode == "managed_gateway" and not await asyncio.to_thread(
+            has_configured_supply, settings, app.state.platform_vault, app.state.SessionLocal,
+        ):
+            raise HTTPException(status_code=503, detail="购买暂不可用：当前没有已配置的上架模型供给。已有订单仍可查询与对账。")
         with app.state.SessionLocal() as session:
             try:
                 # Registration in development also marks email as verified, so

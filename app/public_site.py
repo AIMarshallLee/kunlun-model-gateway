@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from .models import ModelPrice
 from .security import utcnow
+from .services.purchase_supply import has_configured_supply
 
 router = APIRouter()
 STATIC = Path(__file__).resolve().parent / "static"
@@ -62,7 +63,8 @@ def public_catalog(request: Request):
     return JSONResponse({"environment": settings.environment, "currency": "USD", "fetched_at": utcnow().isoformat(),
         "registration_enabled": settings.public_signup,
         "purchasing_enabled": bool(settings.is_production and settings.live_payments and settings.topup_packages
-                                    and request.app.state.live_payment_bridge is not None),
+                                    and request.app.state.live_payment_bridge is not None and settings.payment_provider
+                                    and has_configured_supply(settings, request.app.state.platform_vault, request.app.state.SessionLocal)),
         "models": models, "rate_limit_per_minute": settings.rate_limit_per_minute,
         "terms_url": public_https_url(settings.terms_url), "privacy_url": public_https_url(settings.privacy_url),
         "support_email": settings.complaint_email or None}, headers={"Cache-Control": "no-store"})

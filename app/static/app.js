@@ -17,6 +17,7 @@ const state = {
   lastTestResult: null,
   catalog: null,
   packages: [],
+  purchasingEnabled: false,
 };
 const byId = (id) => document.getElementById(id);
 const checkout = createCheckoutFlow(api, window.location.origin);
@@ -211,7 +212,9 @@ async function loadReady(languageOnly = false) {
   byId("signup-state").textContent = state.ready.public_signup ? t("当前已开启") : t("当前未开放");
   byId("register-form").querySelector("button").disabled = !state.ready.public_signup;
   byId("topup-form").hidden = !state.ready.test_payments;
-  byId("checkout-form").hidden = !state.ready.live_payments;
+  // Keep new purchasing closed until the package/supply read succeeds.
+  byId("checkout-form").hidden = true;
+  byId("new-checkout").hidden = true;
   if (!languageOnly) document.querySelectorAll(".captcha-widget").forEach((node) => { node.hidden = true; });
   if (!languageOnly && state.ready.captcha_required && !isIdentityRoute) {
     if (state.ready.captcha_provider !== "turnstile" || !state.ready.captcha_site_key) {
@@ -225,7 +228,8 @@ async function loadReady(languageOnly = false) {
   byId("provider-value").textContent = managed ? t("渠道实时可用性以实际任务结果为准") : t`${state.ready.providers} 个可用 Provider`;
   if (state.ready.live_payments) {
     if (!languageOnly) {
-      state.packages = (await api("/billing/packages", {auth: false})).packages;
+      const packages = await api("/billing/packages", {auth: false});
+      state.packages = packages.packages; state.purchasingEnabled = packages.purchasing_enabled === true;
       byId("package-select").replaceChildren(...state.packages.map((item) => {
         const option = document.createElement("option"); option.value = item.sku; return option;
       }));
@@ -234,7 +238,11 @@ async function loadReady(languageOnly = false) {
       const item = state.packages.find((entry) => entry.sku === option.value);
       if (item) option.textContent = t`${item.sku} · ${item.payment_amount_minor} ${item.payment_currency}（最小货币单位） → ${amount(item.credit_amount_microusd)}`;
     }
-    byId("payment-boundary").textContent = state.ready.environment === "production"
+    byId("checkout-form").hidden = !state.purchasingEnabled;
+    byId("new-checkout").hidden = !state.purchasingEnabled;
+    byId("payment-boundary").textContent = !state.purchasingEnabled
+      ? t("新购买暂不可用。已有订单、余额与对账仍可查询；不要重复付款。")
+      : state.ready.environment === "production"
       ? t("现金金额与服务额度分别记账；支付回调验签并确认后入账。网页返回不代表支付成功。")
       : t("仅模拟支付验收，不接受真实款项。测试适配器不能证明正式支付可用。");
   }
