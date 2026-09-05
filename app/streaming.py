@@ -57,9 +57,9 @@ class SSEUsageTracker:
         if isinstance(usage, dict):
             prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
             completion = usage.get("completion_tokens", usage.get("output_tokens"))
-            if isinstance(prompt, int) and prompt >= 0:
+            if isinstance(prompt, int) and not isinstance(prompt, bool) and prompt >= 0:
                 self.prompt_tokens = prompt
-            if isinstance(completion, int) and completion >= 0:
+            if isinstance(completion, int) and not isinstance(completion, bool) and completion >= 0:
                 self.completion_tokens = completion
         choices = event.get("choices")
         if not isinstance(choices, list):

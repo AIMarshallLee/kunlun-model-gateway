@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .security import normalize_email
 
@@ -55,6 +55,16 @@ class ResetPasswordRequest(StrictModel):
 
 class KeyCreateRequest(StrictModel):
     name: str = Field(min_length=1, max_length=80)
+    allowed_models: list[str] | None = Field(default=None, min_length=1, max_length=100)
+    max_output_tokens: int | None = Field(default=None, strict=True, ge=1, le=1_000_000)
+    spend_limit_microusd: int | None = Field(default=None, strict=True, ge=1, le=10_000_000_000)
+
+    @field_validator("allowed_models")
+    @classmethod
+    def unique_models(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and (len(set(value)) != len(value) or any(not item or len(item) > 200 for item in value)):
+            raise ValueError("模型列表必须非空且不重复")
+        return value
 
 
 class KeyRevokeRequest(StrictModel):
@@ -99,10 +109,25 @@ class RefundRiskDispositionRequest(StrictModel):
 class AccountStatusRequest(StrictModel):
     action: Literal["freeze", "unfreeze"]
     reason: str = Field(min_length=10, max_length=500)
+    expected_status: Literal["active", "frozen"] | None = None
 
 
 class BudgetAmountRequest(StrictModel):
     amount: int = Field(gt=0, le=10_000_000_000)
+    kind: Literal["prepaid_credit", "provider_spend_cap"] = "prepaid_credit"
+
+
+class ProviderConnectionPutRequest(StrictModel):
+    secret: SecretStr = Field(min_length=8, max_length=4096)
+    label: str | None = Field(default=None, max_length=120)
+
+    @field_validator("secret")
+    @classmethod
+    def secret_has_no_controls(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        if any(ord(char) < 33 or ord(char) == 127 for char in raw):
+            raise ValueError("密钥不能含控制字符或空白")
+        return value
 
 
 class ChatMessage(StrictModel):

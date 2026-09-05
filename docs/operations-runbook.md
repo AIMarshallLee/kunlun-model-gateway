@@ -27,9 +27,9 @@
 
 ## 备份与恢复
 
-备份：`BACKUP_FILE=./backup-$(date +%Y%m%d).dump POSTGRES_USER=... POSTGRES_DB=... ./scripts/backup_postgres.sh`。脚本拒绝覆盖文件并以 0600 掩码创建。
+当前生产数据库为外部 Supabase，旧 Compose 数据库备份／覆盖恢复脚本已停用，始终返回退出码 2。不要继续使用旧 `YES_RESTORE_PRODUCTION` 确认值或假定本项目包含 `postgres` 服务。
 
-恢复前停止 API 或进入维护模式，设置 `CONFIRM_RESTORE=YES_RESTORE_PRODUCTION`，再运行 `BACKUP_FILE=... POSTGRES_USER=... POSTGRES_DB=... ./scripts/restore_postgres.sh`。恢复后以 migrator 角色执行迁移 head，以 runtime 角色执行健康检查、账本对账和一条人工审核冒烟任务，并记录结果。不得把恢复成功等同于支付、SMTP、CAPTCHA 或真实模型供应商已经联调。
+执行范围、隔离自动化和真实项目审批清单见[恢复验收](RESTORE-ACCEPTANCE.md)。CI 只在合成 PostgreSQL 库验证新空目标恢复、完整数据、预算占用、账本和权限；真实 Supabase 的备份时点、加密密钥、跨集群角色及恢复后支付／模型对账必须另行验证和批准。
 
 ## 事故边界
 

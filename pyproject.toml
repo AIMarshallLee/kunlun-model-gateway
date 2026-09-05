@@ -23,7 +23,7 @@ test = ["coverage>=7.6,<8", "pytest>=7.4,<9"]
 [project.scripts]
 kunlun-opencode-install = "scripts.opencode_install:main"
 kunlun-mint-ops-token = "scripts.mint_ops_token:main"
-kunlun-production-preflight = "scripts.preflight:main"
+kunlun-production-preflight = "scripts.preflight:cli"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -32,6 +32,7 @@ addopts = "-ra"
 
 [tool.setuptools.package-data]
 app = ["static/*.html", "static/*.css", "static/*.js"]
+scripts = ["assets/*.js"]
 
 [tool.setuptools]
 py-modules = ["gateway"]

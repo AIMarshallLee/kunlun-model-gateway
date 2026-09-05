@@ -127,6 +127,25 @@ class SmtpEmailSender:
         message["To"] = recipient
         message["Subject"] = subject
         message.set_content(f"{intro}\n\n{link}\n\n如果不是你本人操作，请忽略本邮件。")
+        self._deliver(message)
+
+    def send_operator_alert(self, recipient: str, notification_id: str, summary: dict) -> None:
+        from uuid import UUID
+        from .alert_notifications import recipient_digest, safe_rules
+        recipient_digest(recipient)
+        reference = str(UUID(notification_id))
+        observed = datetime.fromisoformat(summary["observed_at"]).isoformat()
+        lines = [f"{row['severity']}: {row['rule']} ({row['count']})" for row in safe_rules(summary["rules"])]
+        message = MimeEmailMessage()
+        message["From"], message["To"] = self.from_address, recipient
+        message["Subject"] = "Kunlun operational alert digest"
+        message["Message-ID"] = f"<{reference}@{urlparse(self.public_base_url).hostname}>"
+        message.set_content(f"Observed: {observed}\nReference: {reference}\n\n" + "\n".join(lines) +
+            f"\n\nInspect current state: {self.public_base_url}/ops/console\n" +
+            "This summary is not incident resolution or proof of supplier health. No financial action was performed.")
+        self._deliver(message)
+
+    def _deliver(self, message: MimeEmailMessage) -> None:
         try:
             if self.use_ssl:
                 client = self._smtp_ssl_factory(
@@ -144,7 +163,8 @@ class SmtpEmailSender:
                     client.ehlo()
                 if self.username:
                     client.login(self.username, self.password or "")
-                client.send_message(message)
+                if client.send_message(message):
+                    raise IdentityError("邮件收件人未被接受")
         except Exception as exc:
             # SMTP libraries frequently include server responses and account
             # names in exception strings; never pass them to callers or logs.
@@ -302,7 +322,7 @@ def reset_password(session, raw_token: str, new_password: str, pepper: str, _ses
     session.execute(update(AccessSession).where(AccessSession.user_id == record.user_id).values(revoked=True))
     session.execute(update(ApiKey).where(
         ApiKey.user_id == record.user_id,
-        ApiKey.status == "active",
+        ApiKey.status.in_(("active", "frozen")),
     ).values(status="revoked", revoked_at=now))
     session.commit()
     session.expire_all()
@@ -326,7 +346,7 @@ def enforce_key_limit(session, user_id: str, max_active_keys: int) -> None:
         raise IdentityError("邮箱尚未验证")
     count = session.scalar(select(func.count()).select_from(ApiKey).where(
         ApiKey.user_id == user_id,
-        ApiKey.status == "active",
+        ApiKey.status.in_(("active", "frozen")),
     )) or 0
     if count >= max_active_keys:
         raise IdentityError("API Key 数量已达到上限")
@@ -346,7 +366,7 @@ def apply_user_freeze(session, user_id: str, *, now: datetime | None = None) -> 
     frozen_at = now or utcnow()
     key_count = session.execute(update(ApiKey).where(
         ApiKey.user_id == user_id,
-        ApiKey.status == "active",
+        ApiKey.status.in_(("active", "frozen")),
     ).values(status="revoked", revoked_at=frozen_at)).rowcount
     session.execute(update(AccessSession).where(AccessSession.user_id == user_id, AccessSession.revoked.is_(False)).values(revoked=True))
     session.execute(update(EmailVerificationToken).where(

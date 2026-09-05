@@ -34,6 +34,8 @@ sidecar 将原始 JSON 回调转发给网关，由 `verify_webhook(raw_body, hea
 
 ## 失败语义
 
+已新增[拒付账务契约](CHARGEBACK-ACCEPTANCE.md)：规范化 `payment.charged_back` 必须带已签名的 `merchant_id` 和稳定 `provider_dispute_id`，仅表示经支付方确认的本金扣款。整笔、未重叠的已入账购买可幂等冲正；部分、乱序和退款重叠保存为待对账，不重复扣额度。争议通知并不都意味着实际扣款，正式 SDK 映射与返还/费用处理仍未完成。
+
 网络异常、HTTP 失败状态、超大响应、无效 JSON、签名错误、时间窗错误、金额/订单/交易号不匹配都抛出已脱敏的 `PaymentBridgeError`。异常不包含上游正文、请求 body、密钥或底层错误文本；调用方不得在不确定的支付状态下自动重复扣款，应进入 query/reconcile 队列。网关先把 checkout 原子切换为 `checkout_requesting` 并持久化租约，只有取得租约的调用方可以接触 sidecar；新鲜租约的并发请求返回 409，过期租约转 `pending_reconciliation`，不得自动重建支付意图。认证的成功 webhook 可以在 checkout HTTP 响应返回前直接完成入账，pending 回调抢跑则进入对账。
 
 网关在调用退款 sidecar 前先持久化 `requesting` 退款命令并把订单原子切换为 `refunding`；不确定结果转为 `pending_reconciliation`。当前产品只支持全额退款，数据库强制每订单最多一条退款记录。只有完全相同的退款幂等键可在五分钟租约过期后原子重领，或由认证退款 webhook 完成同一预留命令；不同键、并发命令或变化的 `provider_refund_id` 必须拒绝。同一用户不同订单并发退款会通过钱包行锁串行完成，不能让两笔账本冲正建立在同一个旧余额快照上。

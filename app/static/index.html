@@ -6,15 +6,17 @@
   <meta name="color-scheme" content="light">
   <title>昆仑模型网关｜开发者控制台</title>
   <link rel="stylesheet" href="/assets/styles.css">
-  <script src="/assets/app.js" defer></script>
+  <script src="/assets/app.js" type="module"></script>
 </head>
 <body>
+  <noscript><p class="boundary-note">JavaScript is required for this console. Do not enter credentials until scripts are available; native form submission is disabled.</p></noscript>
   <header class="masthead">
-    <a class="wordmark" href="/" aria-label="昆仑模型网关首页">
+    <a class="wordmark" href="/" aria-label="昆仑模型网关首页" data-console-link>
       <span class="seal">昆</span>
       <span>昆仑模型网关</span>
     </a>
     <div class="env-strip" id="environment-strip" aria-live="polite">读取运行状态…</div>
+    <button id="console-language" type="button" aria-label="语言" data-no-translate>中文</button>
   </header>
 
   <main>
@@ -23,17 +25,18 @@
       <h1 id="page-title">每一次模型调用，<br><em>先有预算，再有结果。</em></h1>
       <div class="opening-note">
         <span>01</span>
-        <p>注册、API Key、服务额度、预算、成本与故障切换在同一条可审计链路中。这里卖的是可控调用，不是共享账号。</p>
+        <p id="account-introduction">连接模型服务，设置支出上限，查看每次任务的成本与处理状态。</p>
       </div>
     </section>
 
     <section class="auth-shell" id="auth-shell" aria-label="账户入口">
       <div class="auth-intro">
         <p class="kicker">进入控制面</p>
-        <h2>先验证身份，<br>再触碰额度。</h2>
+        <h2>统一的模型入口，<br>清晰的支出上限。</h2>
         <p>会话只保存在当前页面内存中；刷新页面会自动退出。API Key 只显示一次。</p>
       </div>
       <div class="auth-forms">
+        <p id="invitation-note" hidden>本服务由运营人员开通。收到激活链接后，请先设置密码，再在此登录。链接过期或无法登录时，请联系你的交付负责人。</p>
         <form id="login-form" class="form-card">
           <div class="form-heading"><span>登录</span><small>已有账户</small></div>
           <label>邮箱<input name="email" type="email" autocomplete="username" required></label>
@@ -87,9 +90,9 @@
 
       <div class="metric-grid">
         <article class="metric metric-primary">
-          <span>可用服务额度</span>
+          <span id="balance-label">可用服务额度</span>
           <strong id="balance-value">—</strong>
-          <small>microUSD，不可提现</small>
+          <small id="balance-note">microUSD，不可提现</small>
         </article>
         <article class="metric">
           <span>预授权占用</span>
@@ -109,6 +112,15 @@
       </div>
 
       <div class="work-grid">
+        <article class="panel" id="provider-panel" hidden>
+          <div class="panel-title"><div><span>01</span><h3>连接模型账号</h3></div><p>模型费用由你的供应商账号支付；密钥保存后不再显示。</p></div>
+          <form id="provider-form" class="inline-form">
+            <label>供应商<select name="provider" id="provider-select" required></select></label>
+            <label>官方 API Key<input name="secret" type="password" autocomplete="off" required maxlength="8192"></label>
+            <button type="submit">保存 / 更新连接</button>
+          </form>
+          <div id="connection-list" class="record-list"></div>
+        </article>
         <article class="panel panel-keys">
           <div class="panel-title">
             <div><span>01</span><h3>API Keys</h3></div>
@@ -117,6 +129,13 @@
           <form id="key-form" class="inline-form">
             <label><span>用途名称</span><input name="name" maxlength="80" placeholder="例如：OpenCode 主工作区" required></label>
             <button type="submit">生成新 Key</button>
+            <details class="key-policy-fields">
+              <summary>可选权限与消费上限</summary>
+              <p>留空遵循账户与平台限制。累计上限不自动重置；待对账请求继续占用。创建后不能修改限制，需要吊销并创建新 Key。</p>
+              <label><span>允许模型（英文逗号分隔）</span><input name="allowed_models" maxlength="20000" placeholder="test-model, another-model"></label>
+              <label><span>单次输出 Token 上限</span><input name="max_output_tokens" type="number" min="1" max="1000000" step="1"></label>
+              <label><span>累计消费上限（microUSD；1 USD = 1000000）</span><input name="spend_limit_microusd" type="number" min="1" max="10000000000" step="1"></label>
+            </details>
           </form>
           <div class="one-time-secret" id="one-time-secret" hidden>
             <span>立即复制，关闭后无法找回</span>
@@ -140,6 +159,15 @@
             <button type="submit">前往支付</button>
           </form>
           <p class="boundary-note" id="payment-boundary">正式支付未启用。真实充值需要支付机构官方适配器与对账。</p>
+          <div id="checkout-recovery" hidden>
+            <p class="boundary-note">超时不代表订单未创建。保留原编号并查询，勿重复付款。刷新或返回本站后需要重新登录，可从订单列表恢复；网页返回不能确认入账。</p>
+            <p>购买请求编号：<code id="checkout-request-id"></code></p>
+            <pre id="checkout-result" class="boundary-note" aria-live="polite"></pre>
+            <a id="resume-checkout" hidden rel="noreferrer">继续原订单支付 ↗</a>
+            <button id="lookup-checkout" type="button">查询原购买请求</button>
+            <button id="new-checkout" type="button">已核对，开始另一笔购买</button>
+          </div>
+          <button id="refresh-orders" type="button">刷新订单与余额</button>
           <div class="record-list" id="topup-list"></div>
         </article>
 
@@ -149,10 +177,22 @@
             <p>额度不足或预算不足时，上游调用数为零。</p>
           </div>
           <form id="budget-form" class="inline-form">
-            <label><span>月度上限 / microUSD</span><input name="amount" type="number" min="1" value="1000000" required></label>
+            <label><span>月度上限 / microUSD（1 USD = 1,000,000 microUSD）</span><input name="amount" type="number" min="1" max="10000000000" step="1" value="1000000" required></label>
             <button type="submit">设置新预算</button>
           </form>
           <div class="record-list" id="budget-list"></div>
+        </article>
+
+        <article class="panel" id="model-test-panel" hidden>
+          <div class="panel-title"><div><span>04</span><h3>首次调用验收</h3></div><p id="model-test-introduction">先配置模型与预算，再生成网关 Key。此操作可能产生费用。</p></div>
+          <form id="model-test-form" class="inline-form">
+            <label>网关 Key<input name="gateway_key" type="password" autocomplete="off" required></label>
+            <label>模型<select name="model" id="test-model-select" required></select></label>
+            <button type="submit">运行一次连通测试</button>
+          </form>
+          <p>测试发送 “Reply with OK”，最多输出 16 Token。断线时请先查询原任务状态，重新测试可能产生额外费用。</p>
+          <pre id="model-test-result" aria-live="polite"></pre>
+          <button type="button" id="lookup-test" hidden>查询本次任务状态</button>
         </article>
 
         <article class="panel panel-usage">
@@ -166,6 +206,8 @@
               <tbody id="usage-table"></tbody>
             </table>
           </div>
+          <button type="button" id="refresh-usage">刷新任务与成本</button>
+          <pre id="request-detail" aria-live="polite"></pre>
         </article>
 
         <article class="panel panel-ledger">
@@ -185,6 +227,7 @@
   </main>
 
   <footer>
+    <nav id="console-guide-links"><a href="/api-guide" data-console-link>接入指南</a> · <a href="/service-info" data-console-link>服务与支持</a></nav>
     <span>Kunlun / 可审计模型调用</span>
     <span>测试通过 ≠ 公网、支付或合规验收</span>
   </footer>

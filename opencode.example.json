@@ -12,6 +12,7 @@
         "test-model": {
           "name": "Kunlun test-model",
           "limit": {
+            "context": 128000,
             "output": 4096
           }
         }

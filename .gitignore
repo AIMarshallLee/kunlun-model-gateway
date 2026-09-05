@@ -2,6 +2,9 @@
 .env.*
 !.env.example
 !.env.production.example
+!.env.vercel.production.example
+!.env.managed.vercel.example
+!.env.managed.compose.example
 .venv/
 node_modules/
 .wrangler/
@@ -25,5 +28,7 @@ release-artifacts/
 *.log
 *.dump
 *.sql
+!scripts/bootstrap_supabase_vault.sql
+!scripts/ci_fake_supabase_vault.sql
 *.tar.gz
 *.whl

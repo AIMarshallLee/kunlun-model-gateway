@@ -1,0 +1,9 @@
+{
+  "model": "REPLACE_WITH_LISTED_MODEL",
+  "messages": [
+    {"role": "system", "content": "Prepare a short English product announcement draft for human review. Use only supplied facts. Do not invent sales, certifications, customer quotes or performance claims."},
+    {"role": "user", "content": "Synthetic demonstration, not a real brand: Sample Notes is a plain-text note editor. Audience: independent writers. Tone: clear and practical. Prepare a headline and a 100-word draft; mark missing facts as questions."}
+  ],
+  "max_tokens": 256,
+  "stream": false
+}

@@ -37,6 +37,7 @@ def recover_stale_model_reservations(
         )
         .values(
             status="pending_reconciliation",
+            cost_state="pending_reconciliation",
             failure_category="reservation_lease_expired",
             completed_at=recovered_at,
         )

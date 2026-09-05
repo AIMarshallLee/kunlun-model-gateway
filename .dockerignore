@@ -21,3 +21,4 @@ docs
 htmlcov
 release-artifacts
 tests
+tests-browser

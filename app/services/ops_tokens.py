@@ -12,10 +12,19 @@ import time
 
 
 ALLOWED_SCOPES = {
+    "alerts:read",
+    "alerts:write",
+    "models:read",
+    "models:write",
+    "console:read",
+    "audit:read",
+    "channels:read",
+    "channels:write",
     "reconciliation:read",
     "reconciliation:write",
     "accounts:read",
     "accounts:write",
+    "accounts:invite",
     "payments:read",
     "payments:write",
     "payments:risk:write",

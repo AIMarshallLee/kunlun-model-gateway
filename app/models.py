@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -59,12 +59,19 @@ class PasswordResetToken(Base):
 
 class ApiKey(Base):
     __tablename__ = "api_keys"
+    __table_args__ = (
+        CheckConstraint("max_output_tokens IS NULL OR max_output_tokens > 0", name="key_output_positive"),
+        CheckConstraint("spend_limit_microusd IS NULL OR spend_limit_microusd > 0", name="key_spend_positive"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(80))
     secret_digest: Mapped[str] = mapped_column(String(64))
     last_four: Mapped[str] = mapped_column(String(4))
+    allowed_models_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    spend_limit_microusd: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="active", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -185,11 +192,29 @@ class Budget(Base):
         CheckConstraint("limit_microusd > 0", name="budget_limit_positive"),
         CheckConstraint("reserved_microusd >= 0", name="budget_reserved_nonnegative"),
         CheckConstraint("spent_microusd >= 0", name="budget_spent_nonnegative"),
-        CheckConstraint("spent_microusd + reserved_microusd <= limit_microusd", name="budget_within_limit"),
+        # An audited reconciliation may record a verified upstream cost after
+        # the automatic cap was exhausted. It may never coexist with a live
+        # reservation, so normal new requests remain fail-closed.
+        CheckConstraint(
+            "spent_microusd + reserved_microusd <= limit_microusd OR "
+            "(kind = 'provider_spend_cap' AND spent_microusd > limit_microusd "
+            "AND reserved_microusd = 0)",
+            name="budget_within_limit",
+        ),
+        Index(
+            "uq_active_budget_user_kind_period",
+            "user_id",
+            "kind",
+            "period_start",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(32), default="prepaid_credit", index=True)
     limit_microusd: Mapped[int] = mapped_column(BigInteger)
     reserved_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
     spent_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -217,6 +242,16 @@ class ModelPrice(Base):
     effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class PlatformDailyBudget(Base):
+    __tablename__ = "platform_daily_budgets"
+    __table_args__ = (CheckConstraint("limit_microusd > 0 AND spent_microusd >= 0 AND reserved_microusd >= 0", name="platform_budget_nonnegative"),)
+
+    period: Mapped[str] = mapped_column(String(10), primary_key=True)
+    limit_microusd: Mapped[int] = mapped_column(BigInteger)
+    spent_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    reserved_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
 class ModelRequest(Base):
     __tablename__ = "model_requests"
     __table_args__ = (
@@ -236,6 +271,9 @@ class ModelRequest(Base):
     final_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
     final_provider: Mapped[str | None] = mapped_column(String(80), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="reserved", index=True)
+    billing_mode: Mapped[str] = mapped_column(String(24), default="prepaid", index=True)
+    platform_budget_period: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    platform_reserved_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
     price_version: Mapped[int] = mapped_column(Integer)
     input_price: Mapped[int] = mapped_column(BigInteger)
     output_price: Mapped[int] = mapped_column(BigInteger)
@@ -247,6 +285,8 @@ class ModelRequest(Base):
     usage_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
     fallback_count: Mapped[int] = mapped_column(Integer, default=0)
     failure_category: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    final_attempt_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    cost_state: Mapped[str] = mapped_column(String(32), default="reserved", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -263,8 +303,46 @@ class ProviderAttempt(Base):
     status: Mapped[str] = mapped_column(String(32))
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     failure_category: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    credential_connection_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    credential_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pricing_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    input_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    output_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    upstream_cost_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    usage_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
+    billing_status: Mapped[str] = mapped_column(String(32), default="unsettled", index=True)
+    is_final: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class ProviderConnection(Base):
+    """Tenant-owned safe provider metadata; secret bindings live privately."""
+
+    __tablename__ = "provider_connections"
+    __table_args__ = (UniqueConstraint("user_id", "provider", name="uq_provider_connection_user_provider"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(80), index=True)
+    label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True)
+    credential_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CredentialActionAudit(Base):
+    __tablename__ = "credential_action_audits"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    connection_id: Mapped[str] = mapped_column(ForeignKey("provider_connections.id", ondelete="RESTRICT"), index=True)
+    action: Mapped[str] = mapped_column(String(32), index=True)
+    credential_version: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class RateLimitCounter(Base):
@@ -340,6 +418,59 @@ class PaymentRefund(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     claim_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PaymentChargeback(Base):
+    __tablename__ = "payment_chargebacks"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_dispute_id", name="uq_chargeback_provider_dispute"),
+        CheckConstraint("payment_amount_minor > 0 AND credit_amount_microusd > 0", name="chargeback_amount_positive"),
+        CheckConstraint("recovered_microusd >= 0 AND outstanding_microusd >= 0 AND written_off_microusd >= 0 AND recovered_microusd + outstanding_microusd + written_off_microusd <= credit_amount_microusd", name="chargeback_credit_bounds"),
+        CheckConstraint("status IN ('recovered', 'risk', 'pending_reconciliation', 'resolved')", name="chargeback_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    order_id: Mapped[str] = mapped_column(ForeignKey("payment_orders.id", ondelete="RESTRICT"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    provider: Mapped[str] = mapped_column(String(32))
+    provider_dispute_id: Mapped[str] = mapped_column(String(120))
+    payment_amount_minor: Mapped[int] = mapped_column(BigInteger)
+    payment_currency: Mapped[str] = mapped_column(String(3))
+    credit_amount_microusd: Mapped[int] = mapped_column(BigInteger)
+    recovered_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    outstanding_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    written_off_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    risk_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PaymentChargebackReturn(Base):
+    __tablename__ = "payment_chargeback_returns"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_return_id", name="uq_chargeback_return_provider_id"),
+        CheckConstraint("payment_amount_minor > 0", name="chargeback_return_amount_positive"),
+        CheckConstraint("restored_microusd >= 0 AND canceled_risk_microusd >= 0 AND reversed_loss_microusd >= 0", name="chargeback_return_credit_bounds"),
+        CheckConstraint("status IN ('applied', 'pending_reconciliation')", name="chargeback_return_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    order_id: Mapped[str] = mapped_column(ForeignKey("payment_orders.id", ondelete="RESTRICT"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    chargeback_id: Mapped[str | None] = mapped_column(ForeignKey("payment_chargebacks.id", ondelete="RESTRICT"), nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(32))
+    provider_dispute_id: Mapped[str] = mapped_column(String(120))
+    provider_return_id: Mapped[str] = mapped_column(String(120))
+    payment_amount_minor: Mapped[int] = mapped_column(BigInteger)
+    payment_currency: Mapped[str] = mapped_column(String(3))
+    restored_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    canceled_risk_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    reversed_loss_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    risk_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SafetyAudit(Base):

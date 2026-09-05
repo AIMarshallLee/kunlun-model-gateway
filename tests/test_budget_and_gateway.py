@@ -3,8 +3,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app import providers
+from app.models import Budget, User
+from app.services.budget import create_budget, month_bounds
 from gateway import ProviderError
 
 
@@ -58,6 +62,51 @@ def test_budget_replacement_carries_month_to_date_spend(client, funded_api_key, 
     assert replacement.status_code == 201
     assert replacement.json()["spent"] == spent
     assert client.get(f"/budgets/{first['id']}", headers=auth_headers).json()["status"] == "superseded"
+
+
+def test_active_budget_partial_unique_index_rejects_duplicate_rows(client, auth_headers):
+    created = client.post("/budgets", headers=auth_headers, json={"amount": 100}).json()
+    with client.app.state.SessionLocal() as session:
+        user = session.scalar(select(User).where(User.email == "owner@example.com"))
+        original = session.get(Budget, created["id"])
+        assert user is not None and original is not None
+        session.add(Budget(
+            id="duplicate-active-budget",
+            user_id=user.id,
+            kind=original.kind,
+            limit_microusd=200,
+            period_start=original.period_start,
+            period_end=original.period_end,
+            status="active",
+        ))
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+
+def test_budget_replacement_refreshes_stale_active_budget_before_superseding(client, auth_headers):
+    client.post("/budgets", headers=auth_headers, json={"amount": 100})
+    with client.app.state.SessionLocal() as setup:
+        user = setup.scalar(select(User).where(User.email == "owner@example.com"))
+        assert user is not None
+        user_id = user.id
+    stale = client.app.state.SessionLocal()
+    winner = client.app.state.SessionLocal()
+    try:
+        start, _ = month_bounds()
+        assert stale.scalar(select(Budget).where(
+            Budget.user_id == user_id, Budget.status == "active", Budget.period_start == start,
+        )) is not None
+        assert create_budget(winner, user_id, 200).limit_microusd == 200
+        assert create_budget(stale, user_id, 300).limit_microusd == 300
+    finally:
+        stale.close()
+        winner.close()
+    with client.app.state.SessionLocal() as session:
+        active = session.scalars(select(Budget).where(
+            Budget.user_id == user_id, Budget.status == "active",
+        )).all()
+        assert len(active) == 1 and active[0].limit_microusd == 300
 
 
 def test_openai_compatible_models_and_completion_keep_prompt_out_of_logs(client, funded_api_key, caplog):

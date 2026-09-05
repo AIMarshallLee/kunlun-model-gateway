@@ -29,6 +29,7 @@ def test_developer_console_has_security_headers_and_no_inline_credentials(client
     assert "昆仑模型网关" in page.text
     assert "default-src 'self'" in page.headers["Content-Security-Policy"]
     assert "script-src 'self'; frame-src 'none'" in page.headers["Content-Security-Policy"]
+    assert "form-action 'none'" in page.headers["Content-Security-Policy"]
     assert 'id="register-captcha"' in page.text
     assert 'id="forgot-captcha"' in page.text
     assert 'id="resend-captcha"' in page.text
@@ -44,8 +45,13 @@ def test_developer_console_has_security_headers_and_no_inline_credentials(client
     assert script.text.count(consume) == 1
     assert script.text.index(consume) < script.text.index("loadReady()")
     assert "captcha_required && !isIdentityRoute" in script.text
-    assert script.text.startswith('"use strict";\n\n(() => {')
+    assert '<script src="/assets/app.js" type="module"></script>' in page.text
+    assert script.text.startswith('"use strict";\nimport {createCheckoutFlow, checkoutDestination} from "./checkout.js";\nimport {t, language, setLanguage, localizedError, captureStaticLocale} from "./console-locale.js";\n\n(() => {\nconst state = {')
     assert script.text.rstrip().endswith("})();")
+    assert "export " not in script.text
+    module = client.get("/assets/checkout.js").text
+    for forbidden in ("localStorage", "sessionStorage", "document.cookie", "window.location", "fetch("):
+        assert forbidden not in module
 
 
 def test_turnstile_widget_uses_public_site_key_and_exact_csp(tmp_path, monkeypatch):
@@ -62,6 +68,7 @@ def test_turnstile_widget_uses_public_site_key_and_exact_csp(tmp_path, monkeypat
         page = turnstile_client.get("/")
         csp = page.headers["Content-Security-Policy"]
         assert "script-src 'self' https://challenges.cloudflare.com" in csp
+        assert "form-action 'none'" in csp
         assert "frame-src https://challenges.cloudflare.com" in csp
         ready = turnstile_client.get("/readyz").json()
         assert ready["captcha_provider"] == "turnstile"

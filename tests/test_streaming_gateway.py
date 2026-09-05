@@ -4,11 +4,13 @@ import json
 from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 from sqlalchemy import select
 
 from app import providers
 from app.models import ModelRequest, ProviderAttempt
 from app.providers import OpenAICompatibleProvider
+from app.streaming import SSEUsageTracker
 
 
 def _sse(events):
@@ -99,6 +101,23 @@ def test_stream_without_done_marker_is_held_for_reconciliation(client, funded_ap
         request = session.scalar(select(ModelRequest))
         assert request is not None and request.status == "pending_reconciliation"
         assert request.failure_category == "provider_stream_incomplete"
+
+
+@pytest.mark.parametrize("usage", [
+    {"prompt_tokens": True, "completion_tokens": 2},
+    {"prompt_tokens": 2, "completion_tokens": "3"},
+    {"prompt_tokens": -1, "completion_tokens": 2},
+])
+def test_sse_tracker_never_turns_malformed_usage_into_an_automatic_settlement(usage):
+    tracker = SSEUsageTracker()
+    tracker.feed(("data: " + json.dumps({
+        "choices": [{"delta": {"content": "中文", "tool_calls": [{"function": {"arguments": "{\\\"x\\\":1}"}}]}}],
+        "usage": usage,
+    }) + "\n\ndata: [DONE]\n\n").encode())
+    tracker.finish()
+    _response, estimated = tracker.settlement_response("test-model", 5)
+    assert tracker.done is True
+    assert estimated is True
 
 
 def test_stream_can_fail_over_before_downstream_headers(client, funded_api_key, monkeypatch):

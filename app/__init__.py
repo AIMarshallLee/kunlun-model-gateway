@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +28,12 @@ from gateway import ProviderError
 from . import providers
 from .auth import Principal, enforce_auth_rate_limit, require_api_key, require_operator_scope, require_session
 from .config import Settings
+from .customer_delivery import router as delivery_router, recorded_request_response
+from .managed_gateway import router as managed_router
+from .public_site import router as public_router, public_https_url
+from .services import request_limits
+from .services.platform_credentials import SupabasePlatformVault
+from .services.purchase_supply import has_configured_supply
 from .client_ip import TrustedProxyClientIPMiddleware
 from .db import Base, build_engine, build_session_factory, install_ledger_guards
 from .db_guards import SCHEMA_HEAD, assert_schema_revision
@@ -34,13 +41,16 @@ from .models import (
     AccessSession,
     ApiKey,
     Budget,
+    CredentialActionAudit,
     LedgerEntry,
     LedgerTransaction,
     ModelPrice,
     ModelRequest,
     OperatorAction,
+    PaymentChargeback,
     PaymentOrder,
     PaymentRefund,
+    ProviderConnection,
     SafetyAudit,
     User,
     Wallet,
@@ -63,6 +73,7 @@ from .schemas import (
     RefundRiskDispositionRequest,
     ResetPasswordRequest,
     TopupRequest,
+    ProviderConnectionPutRequest,
     VerifyEmailRequest,
 )
 from .security import (
@@ -79,12 +90,16 @@ from .security import (
 from .services import budget as budget_service
 from .services.gateway_billing import (
     BillingError,
+    enforce_key_policy,
+    key_usage,
     mark_pending_reconciliation,
     record_attempt,
     release_model_request,
+    reserve_byok_model_request,
     reserve_model_request,
     settle_model_request,
 )
+from .services.credentials import CredentialVault, DisabledCredentialVault, SecretUnavailable, build_credential_vault
 from .services.ledger import CUSTOMER_AVAILABLE
 from .services.captcha import CaptchaError, CaptchaVerifier
 from .services.content_safety import ContentSafetyError, HttpContentSafetyAdapter, SafetyDecision
@@ -118,6 +133,11 @@ def _seed_prices(app: FastAPI) -> None:
             latest = session.scalar(select(ModelPrice).where(
                 ModelPrice.model == model,
             ).order_by(ModelPrice.version.desc()))
+            if latest is not None and app.state.settings.gateway_mode == "managed_gateway":
+                # Environment prices bootstrap new models only. Restarting or
+                # rolling back an instance must not undo an operator price or
+                # re-list a deliberately unpublished model.
+                continue
             desired_input = int(config["input_microusd_per_million"])
             desired_output = int(config["output_microusd_per_million"])
             desired_limit = int(config.get("max_output_tokens", app.state.settings.max_output_tokens))
@@ -145,10 +165,14 @@ def _seed_prices(app: FastAPI) -> None:
             session.commit()
         except IntegrityError as exc:
             # Another process may have installed the exact same price version
-            # between our SELECT and INSERT. Roll back and accept only an
-            # identical active catalog; conflicting catalogs fail closed.
+            # between our SELECT and INSERT. Managed catalogs thereafter use
+            # DB versions; legacy modes require an identical active catalog.
             session.rollback()
             for model, config in app.state.settings.models.items():
+                if app.state.settings.gateway_mode == "managed_gateway" and session.scalar(
+                    select(ModelPrice.id).where(ModelPrice.model == model).limit(1)
+                ) is not None:
+                    continue
                 latest = session.scalar(select(ModelPrice).where(
                     ModelPrice.model == model,
                     ModelPrice.active.is_(True),
@@ -206,6 +230,11 @@ def create_app(
     payment_provider: str | None = None,
     topup_packages: dict[str, dict[str, Any]] | None = None,
     provider_clients: list[Any] | None = None,
+    credential_vault: CredentialVault | None = None,
+    platform_vault: Any | None = None,
+    gateway_mode: str | None = None,
+    vault_backend: str | None = None,
+    environment: str | None = None,
 ) -> FastAPI:
     settings = Settings.from_env(
         database_url=database_url,
@@ -225,7 +254,16 @@ def create_app(
         content_safety_required=content_safety_required,
         payment_provider=payment_provider,
         topup_packages=topup_packages,
+        gateway_mode=gateway_mode,
+        vault_backend=vault_backend,
+        environment=environment,
     )
+    if settings.gateway_mode == "byok" and settings.environment == "test" and credential_vault is None:
+        raise RuntimeError("test BYOK 必须显式注入 CredentialVault")
+    if settings.gateway_mode == "managed_gateway" and settings.environment == "test" and platform_vault is None:
+        raise RuntimeError("test 平台模式必须显式注入 platform Vault")
+    if settings.gateway_mode == "managed_gateway" and (provider_clients is not None or credential_vault is not None):
+        raise RuntimeError("平台模式禁止全局 Provider 和客户 BYOK 凭据注入")
     if settings.is_production:
         injected_adapters = (
             identity_sender,
@@ -233,7 +271,7 @@ def create_app(
             content_safety_adapter,
             live_payment_bridge,
         )
-        if any(adapter is not None for adapter in injected_adapters) or provider_clients is not None:
+        if any(adapter is not None for adapter in injected_adapters) or provider_clients is not None or credential_vault is not None or platform_vault is not None:
             # The supported production entrypoint builds every live adapter
             # from validated Settings. Dependency injection is reserved for
             # local/test processes so a custom ASGI bootstrap cannot bypass
@@ -246,6 +284,29 @@ def create_app(
         redoc_url=None,
         openapi_url="/openapi.json" if not settings.is_production else None,
     )
+    app.include_router(delivery_router)
+    app.include_router(managed_router)
+    app.include_router(public_router)
+    from .chargeback_routes import router as chargeback_router
+    app.include_router(chargeback_router)
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default 422 representation includes Pydantic's ``input``
+        # and sometimes ``ctx`` fields. Both may contain API keys, prompts or
+        # customer content, so never reflect them back to a caller or logs.
+        safe_errors = [
+            {
+                key: error[key]
+                # ``loc`` may include an unknown user-provided field name.
+                # Keep only framework-owned classification/message fields.
+                for key in ("type", "msg", "url")
+                if key in error
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": safe_errors})
+
     app.state.settings = settings
     app.state.metrics = MetricsRegistry()
     if identity_sender is not None:
@@ -284,6 +345,17 @@ def create_app(
         )
     app.state.engine = build_engine(settings.database_url)
     app.state.SessionLocal = build_session_factory(app.state.engine)
+    # The only production constructor is the Settings-bound Vault adapter.
+    # Test injection remains available outside production, after the engine
+    # exists so a real adapter can probe its actual database role.
+    app.state.credential_vault = (DisabledCredentialVault() if settings.gateway_mode == "managed_gateway"
+                                  else credential_vault or build_credential_vault(settings, app.state.engine))
+    app.state.platform_vault = platform_vault
+    if settings.gateway_mode == "managed_gateway" and settings.is_production:
+        from .services.platform_credentials import platform_contract_errors
+        app.state.platform_vault = SupabasePlatformVault(build_engine(settings.vault_executor_database_url))
+        if platform_contract_errors(app.state.engine, app.state.platform_vault.engine):
+            raise RuntimeError("平台 Vault 隔离契约未通过，拒绝启动")
     if settings.is_production:
         # The runtime database role is intentionally not a migrator. A stale
         # or empty schema fails before any business endpoint is exposed.
@@ -294,7 +366,7 @@ def create_app(
     _seed_prices(app)
     if provider_clients is not None:
         providers.ordered_clients = list(provider_clients)
-    elif settings.live_upstream:
+    elif settings.live_upstream and settings.gateway_mode != "managed_gateway":
         providers.ordered_clients = providers.build_provider_clients(
             settings.providers,
             allowed_hosts=settings.provider_host_allowlist,
@@ -302,19 +374,25 @@ def create_app(
     else:
         providers.ordered_clients = []
     static_dir = Path(__file__).resolve().parent / "static"
+    from .ops_console import router as ops_console_router
+    app.include_router(ops_console_router)
+    from .model_catalog import router as model_catalog_router
+    app.include_router(model_catalog_router)
+    from .ops_alerts import router as ops_alerts_router
+    app.include_router(ops_alerts_router)
     app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
     app.add_middleware(RequestBodyLimitMiddleware)
     if settings.captcha_required and settings.captcha_provider == "turnstile":
         content_security_policy = (
             "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; "
             "frame-src https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data:; "
-            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
         )
     else:
         content_security_policy = (
             "default-src 'self'; script-src 'self'; frame-src 'none'; style-src 'self'; "
             "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
-            "frame-ancestors 'none'; form-action 'self'"
+            "frame-ancestors 'none'; form-action 'none'"
         )
 
     @app.middleware("http")
@@ -357,6 +435,11 @@ def create_app(
         return response
 
     @app.get("/", include_in_schema=False)
+    def homepage() -> FileResponse:
+        page = "home.html" if settings.gateway_mode == "managed_gateway" else "index.html"
+        return FileResponse(static_dir / page, media_type="text/html")
+
+    @app.get("/console", include_in_schema=False)
     def developer_console() -> FileResponse:
         return FileResponse(static_dir / "index.html", media_type="text/html")
 
@@ -385,15 +468,28 @@ def create_app(
         else:
             checks["schema_revision"] = True
         checks["providers"] = not settings.live_upstream or bool(providers.ordered_clients)
+        if settings.gateway_mode == "managed_gateway":
+            checks["providers"] = bool(settings.providers)
         checks["captcha"] = not settings.captcha_required or app.state.captcha is not None
         checks["content_safety"] = not settings.content_safety_required or app.state.content_safety is not None
         checks["payment_bridge"] = not settings.live_payments or app.state.live_payment_bridge is not None
+        if settings.gateway_mode != "byok":
+            checks["credential_vault"] = True
+        else:
+            try:
+                checks["credential_vault"] = bool(app.state.credential_vault.probe())
+            except Exception:
+                checks["credential_vault"] = False
+        if settings.gateway_mode == "managed_gateway":
+            checks["credential_vault"] = bool(app.state.platform_vault.probe())
         report = readiness_report(checks)
         report.update({
+            "environment": settings.environment,
             "public_signup": settings.public_signup,
             "test_payments": settings.enable_test_payments,
             "live_payments": settings.live_payments or app.state.live_payment_bridge is not None,
             "live_upstream": settings.live_upstream,
+            "gateway_mode": settings.gateway_mode,
             "providers": len(providers.ordered_clients),
             "email_verification": settings.require_email_verification,
             "captcha_required": settings.captcha_required,
@@ -662,6 +758,10 @@ def create_app(
     def create_key(payload: KeyCreateRequest, principal: Principal = Depends(require_session)) -> dict[str, Any]:
         raw, parsed = issue_api_key()
         with app.state.SessionLocal() as session:
+            if payload.allowed_models is not None:
+                active_models = set(session.scalars(select(ModelPrice.model).where(ModelPrice.active.is_(True))))
+                if not set(payload.allowed_models).issubset(active_models):
+                    raise HTTPException(422, "API Key 模型范围包含未上架模型")
             try:
                 enforce_key_limit(session, principal.user_id, settings.max_active_api_keys)
             except IdentityError as exc:
@@ -672,14 +772,20 @@ def create_app(
                 name=payload.name,
                 secret_digest=token_digest(parsed.secret, settings.api_key_pepper),
                 last_four=parsed.secret[-4:],
+                allowed_models_json=json.dumps(payload.allowed_models) if payload.allowed_models is not None else None,
+                max_output_tokens=payload.max_output_tokens,
+                spend_limit_microusd=payload.spend_limit_microusd,
             ))
             session.commit()
-        return {"id": parsed.key_id, "name": payload.name, "key": raw, "warning": "仅显示一次"}
+        return {"id": parsed.key_id, "name": payload.name, "key": raw, "warning": "仅显示一次",
+                "allowed_models": payload.allowed_models, "max_output_tokens": payload.max_output_tokens,
+                "spend_limit_microusd": payload.spend_limit_microusd}
 
     @app.get("/v1/keys")
     def list_keys(principal: Principal = Depends(require_session)) -> dict[str, Any]:
         with app.state.SessionLocal() as session:
             records = session.scalars(select(ApiKey).where(ApiKey.user_id == principal.user_id).order_by(ApiKey.created_at)).all()
+            usage = key_usage(session, principal.user_id)
         return {"keys": [{
             "id": item.id,
             "name": item.name,
@@ -687,6 +793,12 @@ def create_app(
             "last_four": item.last_four,
             "created_at": item.created_at.isoformat(),
             "last_used_at": item.last_used_at.isoformat() if item.last_used_at else None,
+            "allowed_models": json.loads(item.allowed_models_json) if item.allowed_models_json is not None else None,
+            "max_output_tokens": item.max_output_tokens,
+            "spend_limit_microusd": item.spend_limit_microusd,
+            "spent_microusd": usage.get(item.id, {}).get("spent_microusd", 0),
+            "reserved_microusd": usage.get(item.id, {}).get("reserved_microusd", 0),
+            "available_microusd": max(0, item.spend_limit_microusd - sum(usage.get(item.id, {}).values())) if item.spend_limit_microusd is not None else None,
         } for item in records]}
 
     @app.post("/v1/keys/revoke", status_code=204)
@@ -701,12 +813,179 @@ def create_app(
             result = session.execute(update(ApiKey).where(
                 ApiKey.id == key_id,
                 ApiKey.user_id == principal.user_id,
-                ApiKey.status == "active",
+                ApiKey.status.in_(("active", "frozen")),
             ).values(status="revoked", revoked_at=utcnow()))
             if result.rowcount != 1:
                 session.rollback()
                 raise HTTPException(status_code=404, detail="API Key 不存在或已吊销")
             session.commit()
+        return Response(status_code=204)
+
+    def _connection_dict(item: ProviderConnection) -> dict[str, Any]:
+        # Never add vault_ref or a secret-derived fingerprint to this boundary.
+        return {
+            "id": item.id,
+            "provider": item.provider,
+            "label": item.label,
+            "status": item.status,
+            "credential_version": item.credential_version,
+            "created_at": item.created_at.isoformat(),
+            "updated_at": item.updated_at.isoformat(),
+            "revoked_at": item.revoked_at.isoformat() if item.revoked_at else None,
+        }
+
+    @app.get("/v1/provider-connections")
+    def list_provider_connections(principal: Principal = Depends(require_session)) -> dict[str, Any]:
+        if settings.gateway_mode == "managed_gateway":
+            raise HTTPException(403, "平台模式不接收客户上游密钥")
+        with app.state.SessionLocal() as session:
+            rows = session.scalars(select(ProviderConnection).where(
+                ProviderConnection.user_id == principal.user_id,
+            ).order_by(ProviderConnection.created_at)).all()
+        return {"data": [_connection_dict(row) for row in rows]}
+
+    @app.put("/v1/provider-connections/{provider}")
+    def put_provider_connection(
+        provider: str,
+        payload: ProviderConnectionPutRequest,
+        principal: Principal = Depends(require_session),
+    ) -> JSONResponse:
+        provider = provider.strip().casefold()
+        if settings.gateway_mode == "managed_gateway":
+            raise HTTPException(403, "平台模式不接收客户上游密钥")
+        if provider not in providers.BYOK_PROVIDER_CATALOG:
+            raise HTTPException(status_code=404, detail="Provider 不在服务端允许目录中")
+        secret = payload.secret.get_secret_value()
+        if app.state.credential_vault.manages_metadata:
+            try:
+                result = app.state.credential_vault.provision(
+                    user_id=principal.user_id, provider=provider, label=payload.label, secret=secret,
+                )
+            except SecretUnavailable as exc:
+                raise HTTPException(status_code=503, detail="凭据 Vault 不可用") from exc
+            finally:
+                del secret
+            return JSONResponse(
+                status_code=201 if result.credential_version == 1 else 200,
+                content={"id": result.id, "provider": result.provider, "label": result.label,
+                         "status": result.status, "credential_version": result.credential_version,
+                         "created_at": result.created_at, "updated_at": result.updated_at,
+                         "revoked_at": result.revoked_at},
+            )
+        with app.state.SessionLocal() as session:
+            item = session.scalar(select(ProviderConnection).where(
+                ProviderConnection.user_id == principal.user_id,
+                ProviderConnection.provider == provider,
+            ).with_for_update())
+            if item is None:
+                connection_id = str(uuid.uuid4())
+                credential_version = 1
+                item = ProviderConnection(
+                    id=connection_id, user_id=principal.user_id, provider=provider,
+                    label=payload.label, status="provisioning", credential_version=credential_version,
+                )
+                session.add(item)
+                action = "created"
+                status_code = 201
+            else:
+                if item.status == "revoked_pending_destroy":
+                    raise HTTPException(status_code=409, detail="凭据连接正在等待 Vault 清理，请稍后重试")
+                connection_id = item.id
+                credential_version = item.credential_version + 1
+                if item.status == "revoked":
+                    # The Vault definer accepts a reconnect only when the
+                    # provisioning row already bears the *new* version.  Keep
+                    # this mutation in the same transaction as ``put``: a
+                    # Vault failure rolls the row back to its revoked state.
+                    item.status = "provisioning"
+                    item.credential_version = credential_version
+                    item.label = payload.label
+                    item.revoked_at = None
+                    action = "reconnected"
+                elif item.status == "active":
+                    old_connection = item.credential_version
+                    action = "rotated"
+                else:
+                    raise HTTPException(status_code=409, detail="凭据连接状态不可操作")
+                status_code = 200
+            session.flush()
+            try:
+                app.state.credential_vault.put(
+                    user_id=principal.user_id, connection_id=connection_id, provider=provider,
+                    credential_version=credential_version, secret=secret,
+                )
+            except SecretUnavailable as exc:
+                session.rollback()
+                raise HTTPException(status_code=503, detail="凭据 Vault 不可用") from exc
+            finally:
+                del secret
+            if action in ("created", "reconnected"):
+                item.status = "active"
+                if action == "reconnected":
+                    item.updated_at = utcnow()
+            else:
+                item.label = payload.label
+                item.revoked_at = None
+                item.credential_version = credential_version
+                item.updated_at = utcnow()
+            if action == "rotated":
+                app.state.credential_vault.destroy(
+                    user_id=principal.user_id, connection_id=connection_id, provider=provider,
+                    credential_version=old_connection,
+                )
+            session.add(CredentialActionAudit(
+                id=str(uuid.uuid4()), user_id=principal.user_id, connection_id=item.id,
+                action=action, credential_version=item.credential_version,
+            ))
+            response = _connection_dict(item)
+            session.commit()
+        return JSONResponse(status_code=status_code, content=response)
+
+    @app.delete("/v1/provider-connections/{provider}", status_code=204)
+    def revoke_provider_connection(provider: str, principal: Principal = Depends(require_session)) -> Response:
+        if settings.gateway_mode == "managed_gateway":
+            raise HTTPException(403, "平台模式不使用客户上游连接")
+        provider = provider.strip().casefold()
+        if app.state.credential_vault.manages_metadata:
+            try:
+                app.state.credential_vault.revoke(user_id=principal.user_id, provider=provider)
+            except SecretUnavailable as exc:
+                raise HTTPException(status_code=503, detail="凭据 Vault 不可用") from exc
+            return Response(status_code=204)
+        with app.state.SessionLocal() as session:
+            item = session.scalar(select(ProviderConnection).where(
+                ProviderConnection.user_id == principal.user_id,
+                ProviderConnection.provider == provider,
+                ProviderConnection.status.in_(("active", "revoked_pending_destroy")),
+            ).with_for_update())
+            if item is None:
+                raise HTTPException(status_code=404, detail="Provider connection 不存在")
+            was_pending = item.status == "revoked_pending_destroy"
+            item.status = "revoked_pending_destroy"
+            item.revoked_at = item.revoked_at or utcnow()
+            item.updated_at = item.revoked_at
+            connection_id = item.id
+            credential_version = item.credential_version
+            session.commit()
+        try:
+            app.state.credential_vault.destroy(
+                user_id=principal.user_id, connection_id=connection_id, provider=provider,
+                credential_version=credential_version,
+            )
+        except SecretUnavailable:
+            # Keep the opaque reference for maintenance retry; never claim
+            # physical deletion when the Vault operation failed.
+            return JSONResponse(status_code=202, content={"status": "revoked_pending_destroy"})
+        with app.state.SessionLocal() as session:
+            item = session.get(ProviderConnection, connection_id, with_for_update=True)
+            if item is not None and item.status == "revoked_pending_destroy":
+                item.status = "revoked"
+                session.add(CredentialActionAudit(
+                    id=str(uuid.uuid4()), user_id=principal.user_id,
+                    connection_id=connection_id, action="revoked",
+                    credential_version=credential_version,
+                ))
+                session.commit()
         return Response(status_code=204)
 
     @app.post("/billing/topups", status_code=201)
@@ -728,7 +1007,10 @@ def create_app(
 
     @app.get("/billing/packages")
     def live_payment_packages() -> dict[str, Any]:
-        return {"packages": [{
+        purchasing_enabled = bool(app.state.live_payment_bridge is not None and settings.payment_provider
+            and settings.topup_packages and (settings.gateway_mode != "managed_gateway" or
+                has_configured_supply(settings, app.state.platform_vault, app.state.SessionLocal)))
+        return {"purchasing_enabled": purchasing_enabled, "packages": [{
             "sku": sku,
             "payment_amount_minor": int(package["payment_amount_minor"]),
             "payment_currency": str(package["payment_currency"]),
@@ -771,6 +1053,10 @@ def create_app(
             principal.user_id,
             settings.checkout_rate_limit_per_minute,
         )
+        if settings.gateway_mode == "managed_gateway" and not await asyncio.to_thread(
+            has_configured_supply, settings, app.state.platform_vault, app.state.SessionLocal,
+        ):
+            raise HTTPException(status_code=503, detail="购买暂不可用：当前没有已配置的上架模型供给。已有订单仍可查询与对账。")
         with app.state.SessionLocal() as session:
             try:
                 # Registration in development also marks email as verified, so
@@ -899,6 +1185,8 @@ def create_app(
                     payment_currency=event.currency,
                     provider_transaction_id=event.provider_transaction_id,
                     provider_refund_id=event.provider_refund_id,
+                    provider_dispute_id=event.provider_dispute_id,
+                    provider_return_id=event.provider_return_id,
                 )
             except PaymentDomainError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -951,6 +1239,47 @@ def create_app(
             "created_at": item.created_at.isoformat(),
         } for item in records]}
 
+    def customer_order_snapshot(user_id: str, criterion) -> JSONResponse:
+        # Recovery only reads our order snapshot. It never creates a payment
+        # intent, calls a supplier, or interprets a browser redirect as payment.
+        with app.state.SessionLocal() as session:
+            order = session.scalar(select(PaymentOrder).where(
+                PaymentOrder.user_id == user_id, criterion,
+            ))
+            if order is None:
+                raise HTTPException(404, "订单未找到；原请求可能仍在途中，请勿改用新编号自动重试")
+            checkout_url = public_https_url(order.checkout_url) if order.status == "pending" else None
+            action = "contact_support"
+            if checkout_url:
+                action = "resume_checkout"
+            elif order.status == "checkout_requesting":
+                action = "wait_and_query"
+            elif order.status == "paid":
+                action = "check_balance"
+            elif order.status in ("closed", "refunded", "expired", "failed"):
+                action = "review_order"
+            return JSONResponse({
+                "id": order.id, "status": order.status, "next_action": action,
+                "checkout_url": checkout_url,
+                "payment_amount_minor": order.payment_amount_minor,
+                "payment_currency": order.payment_currency,
+                "credit_amount_microusd": order.credit_amount_microusd,
+                "created_at": order.created_at.isoformat(),
+            }, headers={"Cache-Control": "no-store"})
+
+    @app.post("/billing/checkout/lookup")
+    def lookup_customer_checkout(
+        principal: Principal = Depends(require_session),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> JSONResponse:
+        if not idempotency_key or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", idempotency_key):
+            raise HTTPException(422, "必须提供有效的 Idempotency-Key")
+        return customer_order_snapshot(principal.user_id, PaymentOrder.client_idempotency_key == idempotency_key)
+
+    @app.get("/billing/topups/{order_id}")
+    def customer_order_detail(order_id: str, principal: Principal = Depends(require_session)) -> JSONResponse:
+        return customer_order_snapshot(principal.user_id, PaymentOrder.id == order_id)
+
     @app.get("/billing/ledger")
     def ledger(principal: Principal = Depends(require_session)) -> dict[str, Any]:
         with app.state.SessionLocal() as session:
@@ -973,7 +1302,9 @@ def create_app(
     def create_budget(payload: BudgetAmountRequest, principal: Principal = Depends(require_session)) -> dict[str, Any]:
         with app.state.SessionLocal() as session:
             try:
-                budget = budget_service.create_budget(session, principal.user_id, payload.amount)
+                budget = budget_service.create_budget(
+                    session, principal.user_id, payload.amount, kind=payload.kind,
+                )
             except budget_service.BudgetError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         return _budget_dict(budget)
@@ -997,6 +1328,7 @@ def create_app(
     def _budget_dict(budget: Budget) -> dict[str, Any]:
         return {
             "id": budget.id,
+            "kind": budget.kind,
             "amount": budget.limit_microusd,
             "reserved": budget.reserved_microusd,
             "spent": budget.spent_microusd,
@@ -1017,7 +1349,13 @@ def create_app(
     @app.get("/v1/models")
     def models(_principal: Principal = Depends(require_api_key)) -> dict[str, Any]:
         with app.state.SessionLocal() as session:
-            records = session.scalars(select(ModelPrice).where(ModelPrice.active.is_(True)).order_by(ModelPrice.model)).all()
+            key = session.get(ApiKey, _principal.api_key_id)
+            if key is None or key.status != "active":
+                raise HTTPException(401, "API Key 已失效")
+            query = select(ModelPrice).where(ModelPrice.active.is_(True))
+            if key.allowed_models_json is not None:
+                query = query.where(ModelPrice.model.in_(json.loads(key.allowed_models_json)))
+            records = session.scalars(query.order_by(ModelPrice.model)).all()
         return {"object": "list", "data": [{
             "id": item.model,
             "object": "model",
@@ -1034,6 +1372,8 @@ def create_app(
         # Keep the key in the same bounded ASCII namespace as payment commands.
         # Reject before provider selection or reservation so malformed retries
         # cannot create billing state or reach an upstream.
+        if ((settings.is_production and settings.gateway_mode == "byok") or settings.gateway_mode == "managed_gateway") and not idempotency_key:
+            return _openai_error(428, "此网关模式要求提供 Idempotency-Key", "idempotency_key_required")
         if idempotency_key is not None and not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", idempotency_key,
         ):
@@ -1041,7 +1381,57 @@ def create_app(
         max_output = payload.max_completion_tokens or payload.max_tokens or settings.default_output_tokens
         if max_output > settings.max_output_tokens:
             return _openai_error(422, "输出 Token 上限超过平台策略", "max_output_tokens_exceeded")
-        eligible = [client for client in providers.ordered_clients if providers.supports_model(client, payload.model)]
+        if settings.gateway_mode == "disabled":
+            return _openai_error(503, "网关当前已禁用", "gateway_disabled")
+        with app.state.SessionLocal() as session:
+            key = session.get(ApiKey, principal.api_key_id)
+            try:
+                enforce_key_policy(key, payload.model, max_output)
+            except BillingError as exc:
+                return _openai_error(exc.status_code, str(exc), "key_policy_rejected")
+        if idempotency_key:
+            with app.state.SessionLocal() as session:
+                recorded = recorded_request_response(session, principal.user_id, idempotency_key)
+            if recorded is not None:
+                return recorded
+        byok_candidates: list[tuple[ProviderConnection, dict[str, Any]]] = []
+        if settings.gateway_mode == "byok":
+            # Select tenant-owned metadata by authenticated principal only.
+            # Secret resolution happens only after the durable budget hold,
+            # immediately before each bounded outbound attempt.
+            with app.state.SessionLocal() as session:
+                connections = session.scalars(select(ProviderConnection).where(
+                    ProviderConnection.user_id == principal.user_id,
+                    ProviderConnection.status == "active",
+                ).order_by(ProviderConnection.updated_at.desc())).all()
+            if not connections:
+                return _openai_error(503, "未配置可用的 BYOK Provider connection", "byok_credential_unavailable")
+            for connection in connections:
+                catalog = next((item for item in settings.providers if isinstance(item, dict) and str(item.get("name", "")).casefold() == connection.provider), None)
+                if catalog is not None and payload.model in set(catalog.get("models") or []):
+                    byok_candidates.append((connection, catalog))
+            if not byok_candidates:
+                return _openai_error(503, "当前模型没有可用的 BYOK Provider", "no_provider")
+            # The DB price is the durable pre-authorisation ceiling. Its value
+            # must cover every route this process could use, including a route
+            # from an older rolling-deploy instance.
+            candidate_input_floor = max(
+                int(catalog["pricing"][payload.model]["input_microusd_per_million"])
+                for _connection, catalog in byok_candidates
+            )
+            candidate_output_floor = max(
+                int(catalog["pricing"][payload.model]["output_microusd_per_million"])
+                for _connection, catalog in byok_candidates
+            )
+            eligible: list[Any] = byok_candidates
+        elif settings.gateway_mode == "managed_gateway":
+            eligible = [item for item in settings.providers if payload.model in item.get("models", [])]
+            candidate_input_floor = max((item["pricing"][payload.model]["input_microusd_per_million"] for item in eligible), default=0)
+            candidate_output_floor = max((item["pricing"][payload.model]["output_microusd_per_million"] for item in eligible), default=0)
+        else:
+            candidate_input_floor = None
+            candidate_output_floor = None
+            eligible = [client for client in providers.ordered_clients if providers.supports_model(client, payload.model)]
         if not eligible:
             return _openai_error(503, "当前没有可用且符合策略的模型供应商", "no_provider")
         messages = [message.model_dump(exclude_none=True) for message in payload.messages]
@@ -1059,7 +1449,32 @@ def create_app(
             key: value for key, value in upstream_payload.items()
             if key not in {"stream", "stream_options"}
         }
-        input_audit_id: str | None = None
+        # Reserve before moderation too: a rejected budget must not trigger
+        # any paid/network service. A safety rejection releases the hold.
+        with app.state.SessionLocal() as session:
+            try:
+                reservation = (
+                    reserve_byok_model_request(
+                        session, user_id=principal.user_id, api_key_id=principal.api_key_id or "",
+                        model=payload.model, billable_payload=billable_payload,
+                        max_output_tokens=max_output, idempotency_key=idempotency_key,
+                        minimum_input_price=candidate_input_floor,
+                        minimum_output_price=candidate_output_floor,
+                    ) if settings.gateway_mode == "byok" else reserve_model_request(
+                        session, user_id=principal.user_id, api_key_id=principal.api_key_id or "",
+                        model=payload.model, billable_payload=billable_payload,
+                        max_output_tokens=max_output, idempotency_key=idempotency_key,
+                        managed_cost_prices=(candidate_input_floor, candidate_output_floor) if settings.gateway_mode == "managed_gateway" else None,
+                        platform_daily_limit=settings.platform_daily_budget_microusd,
+                    )
+                )
+            except BillingError as exc:
+                if exc.status_code == 409 and idempotency_key:
+                    session.rollback()
+                    recorded = recorded_request_response(session, principal.user_id, idempotency_key)
+                    if recorded is not None:
+                        return recorded
+                return _openai_error(exc.status_code, str(exc), "billing_rejected")
         if app.state.content_safety is not None:
             try:
                 input_decision: SafetyDecision = await app.state.content_safety.check(
@@ -1083,7 +1498,7 @@ def create_app(
                     id=input_audit_id,
                     user_id=principal.user_id,
                     api_key_id=principal.api_key_id or "",
-                    request_id=None,
+                    request_id=reservation.request_id,
                     phase="input",
                     outcome=input_outcome,
                     reason_code=input_reason,
@@ -1091,30 +1506,80 @@ def create_app(
                     policy_version=settings.content_safety_policy_version or None,
                 ))
                 session.commit()
+                if not input_decision.allowed:
+                    release_model_request(session, reservation.request_id, "input_safety_" + input_outcome)
             if input_outcome == "unavailable":
-                return _openai_error(503, "内容安全服务不可用，已拒绝本次请求", "safety_unavailable")
+                return _openai_error(503, "内容安全服务不可用，已拒绝本次请求", "safety_unavailable", request_id=reservation.request_id)
             if not input_decision.allowed:
-                return _openai_error(403, "请求未通过内容安全策略", "content_policy_rejected")
-        with app.state.SessionLocal() as session:
-            try:
-                reservation = reserve_model_request(
-                    session,
-                    user_id=principal.user_id,
-                    api_key_id=principal.api_key_id or "",
-                    model=payload.model,
-                    billable_payload=billable_payload,
-                    max_output_tokens=max_output,
-                    idempotency_key=idempotency_key,
-                )
-            except BillingError as exc:
-                return _openai_error(exc.status_code, str(exc), "billing_rejected")
-            if input_audit_id is not None:
-                session.execute(update(SafetyAudit).where(
-                    SafetyAudit.id == input_audit_id,
-                ).values(request_id=reservation.request_id))
-                session.commit()
+                return _openai_error(403, "请求未通过内容安全策略", "content_policy_rejected", request_id=reservation.request_id)
         last_error: ProviderError | None = None
-        for index, client in enumerate(eligible):
+        route_deadline = time.monotonic() + request_limits.MANAGED_REQUEST_SECONDS if settings.gateway_mode == "managed_gateway" else None
+        for index, candidate in enumerate(eligible):
+            if route_deadline is not None and time.monotonic() >= route_deadline:
+                # Reached only before the first attempt or after an explicitly
+                # non-billable failure. No uncertain request reaches this branch.
+                with app.state.SessionLocal() as session:
+                    release_model_request(session, reservation.request_id, "routing_deadline_exceeded")
+                return _openai_error(504, "路由总时限已耗尽，未继续外呼", "routing_deadline_exceeded", request_id=reservation.request_id)
+            attempt_started_at = utcnow()
+            connection: ProviderConnection | None = None
+            attempt_metadata: dict[str, Any] = {}
+            if settings.gateway_mode == "byok":
+                connection, catalog = candidate
+                try:
+                    transient_secret = app.state.credential_vault.get(
+                        user_id=principal.user_id, connection_id=connection.id, provider=connection.provider,
+                        credential_version=connection.credential_version,
+                    )
+                    client = providers.build_byok_provider_client(
+                        catalog, api_key=transient_secret, allowed_hosts=settings.provider_host_allowlist,
+                    )
+                except (SecretUnavailable, RuntimeError):
+                    with app.state.SessionLocal() as session:
+                        attempt_id = record_attempt(
+                            session, request_id=reservation.request_id, ordinal=index + 1,
+                            provider=connection.provider, model=payload.model, status="failed",
+                            failure_category="byok_credential_unavailable",
+                            credential_connection_id=connection.id, credential_version=connection.credential_version,
+                            pricing_snapshot={"source": "provider_catalog"}, started_at=attempt_started_at,
+                            billing_status="not_billed",
+                        )
+                    if index + 1 < len(eligible):
+                        continue
+                    with app.state.SessionLocal() as session:
+                        release_model_request(
+                            session, reservation.request_id, "byok_credential_unavailable", attempt_id=attempt_id,
+                        )
+                    return _openai_error(503, "凭据 Vault 或 Provider 目录不可用", "byok_credential_unavailable", request_id=reservation.request_id)
+                finally:
+                    if "transient_secret" in locals():
+                        del transient_secret
+                attempt_metadata = {
+                    "credential_connection_id": connection.id,
+                    "credential_version": connection.credential_version,
+                    "pricing_snapshot": {"source": "provider_catalog"},
+                }
+            elif settings.gateway_mode == "managed_gateway":
+                catalog = candidate
+                try:
+                    transient_secret, channel_id, channel_version = app.state.platform_vault.resolve(catalog["name"])
+                    client = providers.build_managed_provider_client(catalog, api_key=transient_secret, allowed_hosts=settings.provider_host_allowlist)
+                    attempt_metadata = {"credential_connection_id": channel_id, "credential_version": channel_version}
+                except (SecretUnavailable, RuntimeError):
+                    with app.state.SessionLocal() as session:
+                        attempt_id = record_attempt(session, request_id=reservation.request_id, ordinal=index + 1,
+                            provider=catalog["name"], model=payload.model, status="failed", billing_status="not_billed",
+                            failure_category="platform_credential_unavailable")
+                    if index + 1 < len(eligible):
+                        continue
+                    with app.state.SessionLocal() as session:
+                        release_model_request(session, reservation.request_id, "platform_credential_unavailable", attempt_id=attempt_id)
+                    return _openai_error(503, "平台供应渠道不可用", "platform_credential_unavailable", request_id=reservation.request_id)
+                finally:
+                    if "transient_secret" in locals():
+                        del transient_secret
+            else:
+                client = candidate
             name = providers.provider_name(client, index)
             upstream_input_price, upstream_output_price = providers.upstream_prices(
                 client,
@@ -1122,13 +1587,18 @@ def create_app(
                 reservation.input_price,
                 reservation.output_price,
             )
+            attempt_metadata["pricing_snapshot"] = {
+                "input_microusd_per_million": upstream_input_price,
+                "output_microusd_per_million": upstream_output_price,
+            }
+            attempt_id: str | None = None
             try:
                 open_stream = getattr(type(client), "open_stream", None)
                 if direct_upstream_stream and callable(open_stream):
-                    upstream_stream = await open_stream(client, upstream_payload)
+                    upstream_stream = await request_limits.await_with_deadline(open_stream(client, upstream_payload), route_deadline)
                     try:
                         with app.state.SessionLocal() as session:
-                            record_attempt(
+                            attempt_id = record_attempt(
                                 session,
                                 request_id=reservation.request_id,
                                 ordinal=index + 1,
@@ -1136,6 +1606,8 @@ def create_app(
                                 model=payload.model,
                                 status="stream_opened",
                                 status_code=200,
+                                started_at=attempt_started_at,
+                                **attempt_metadata,
                             )
                     except Exception:
                         try:
@@ -1150,7 +1622,7 @@ def create_app(
 
                     async def forward_stream():
                         try:
-                            async for chunk in upstream_stream.chunks():
+                            async for chunk in request_limits.chunks_with_deadline(upstream_stream.chunks(), route_deadline):
                                 tracker.feed(chunk)
                                 yield chunk
                             tracker.finish()
@@ -1162,6 +1634,7 @@ def create_app(
                                         "provider_stream_incomplete",
                                         provider=name,
                                         fallback_count=index,
+                                        attempt_id=attempt_id,
                                     )
                                 return
                             settlement_response, estimated = tracker.settlement_response(
@@ -1179,6 +1652,7 @@ def create_app(
                                         force_usage_estimated=estimated,
                                         upstream_input_price=upstream_input_price,
                                         upstream_output_price=upstream_output_price,
+                                        attempt_id=attempt_id,
                                     )
                                 except BillingError:
                                     mark_pending_reconciliation(
@@ -1187,6 +1661,7 @@ def create_app(
                                         "settlement_failed",
                                         provider=name,
                                         fallback_count=index,
+                                        attempt_id=attempt_id,
                                     )
                         except asyncio.CancelledError:
                             with app.state.SessionLocal() as session:
@@ -1196,6 +1671,7 @@ def create_app(
                                     "client_disconnected",
                                     provider=name,
                                     fallback_count=index,
+                                    attempt_id=attempt_id,
                                 )
                             raise
                         except (StreamProtocolError, ProviderError):
@@ -1206,6 +1682,7 @@ def create_app(
                                     "provider_stream_failed",
                                     provider=name,
                                     fallback_count=index,
+                                    attempt_id=attempt_id,
                                 )
                         except Exception:
                             logger.error(
@@ -1219,6 +1696,7 @@ def create_app(
                                     "unexpected_stream_failure",
                                     provider=name,
                                     fallback_count=index,
+                                    attempt_id=attempt_id,
                                 )
                         finally:
                             try:
@@ -1239,11 +1717,11 @@ def create_app(
                             "Cache-Control": "no-cache, no-store",
                         },
                     )
-                result = await client(upstream_payload)
+                result = await request_limits.await_with_deadline(client(upstream_payload), route_deadline)
                 if not isinstance(result, dict):
                     raise ProviderError(502, category="provider_invalid_payload", safe_to_failover=False, request_may_be_billable=True)
                 with app.state.SessionLocal() as session:
-                    record_attempt(
+                    attempt_id = record_attempt(
                         session,
                         request_id=reservation.request_id,
                         ordinal=index + 1,
@@ -1251,6 +1729,8 @@ def create_app(
                         model=payload.model,
                         status="succeeded",
                         status_code=200,
+                        started_at=attempt_started_at,
+                        **attempt_metadata,
                     )
                 output_outcome: str | None = None
                 if app.state.content_safety is not None:
@@ -1291,6 +1771,7 @@ def create_app(
                             fallback_count=index,
                             upstream_input_price=upstream_input_price,
                             upstream_output_price=upstream_output_price,
+                            attempt_id=attempt_id,
                         )
                     except BillingError:
                         mark_pending_reconciliation(
@@ -1299,6 +1780,7 @@ def create_app(
                             "settlement_failed",
                             provider=name,
                             fallback_count=index,
+                            attempt_id=attempt_id,
                         )
                         return _openai_error(503, "调用成功但结算待人工对账", "settlement_pending", request_id=reservation.request_id)
                 if output_outcome == "unavailable":
@@ -1338,7 +1820,7 @@ def create_app(
             except ProviderError as exc:
                 last_error = exc
                 with app.state.SessionLocal() as session:
-                    record_attempt(
+                    attempt_id = record_attempt(
                         session,
                         request_id=reservation.request_id,
                         ordinal=index + 1,
@@ -1347,6 +1829,9 @@ def create_app(
                         status="failed",
                         status_code=exc.status_code,
                         failure_category=exc.category,
+                        started_at=attempt_started_at,
+                        billing_status="unknown" if exc.request_may_be_billable else "not_billed",
+                        **attempt_metadata,
                     )
                 if exc.request_may_be_billable:
                     with app.state.SessionLocal() as session:
@@ -1356,14 +1841,23 @@ def create_app(
                             exc.category,
                             provider=name,
                             fallback_count=index,
+                            attempt_id=attempt_id,
                         )
                     return _openai_error(502, "上游状态不确定，已转人工对账且未自动切换", "reconciliation_pending", request_id=reservation.request_id)
                 if exc.safe_to_failover and index + 1 < len(eligible):
                     continue
                 with app.state.SessionLocal() as session:
-                    release_model_request(session, reservation.request_id, exc.category)
+                    release_model_request(session, reservation.request_id, exc.category, attempt_id=attempt_id)
                 return _openai_error(exc.status_code, "模型供应商拒绝或不可用", exc.category, request_id=reservation.request_id)
             except asyncio.CancelledError:
+                if attempt_id is None:
+                    with app.state.SessionLocal() as session:
+                        attempt_id = record_attempt(
+                            session, request_id=reservation.request_id, ordinal=index + 1,
+                            provider=name, model=payload.model, status="uncertain",
+                            failure_category="client_disconnected", started_at=attempt_started_at,
+                            billing_status="unknown", **attempt_metadata,
+                        )
                 with app.state.SessionLocal() as session:
                     mark_pending_reconciliation(
                         session,
@@ -1371,12 +1865,21 @@ def create_app(
                         "client_disconnected",
                         provider=name,
                         fallback_count=index,
+                        attempt_id=attempt_id,
                     )
                 raise
             except Exception:
                 # Never attach arbitrary exception text or traceback: provider SDK
                 # exceptions can contain request bodies or Authorization headers.
                 logger.error("gateway internal provider failure request_id=%s category=unexpected", reservation.request_id)
+                if attempt_id is None:
+                    with app.state.SessionLocal() as session:
+                        attempt_id = record_attempt(
+                            session, request_id=reservation.request_id, ordinal=index + 1,
+                            provider=name, model=payload.model, status="uncertain",
+                            failure_category="unexpected_provider_failure", started_at=attempt_started_at,
+                            billing_status="unknown", **attempt_metadata,
+                        )
                 with app.state.SessionLocal() as session:
                     mark_pending_reconciliation(
                         session,
@@ -1384,6 +1887,7 @@ def create_app(
                         "unexpected_provider_failure",
                         provider=name,
                         fallback_count=index,
+                        attempt_id=attempt_id,
                     )
                 return _openai_error(502, "上游状态不确定，已转人工对账", "reconciliation_pending", request_id=reservation.request_id)
         with app.state.SessionLocal() as session:
@@ -1524,6 +2028,8 @@ def create_app(
             if user is None:
                 raise HTTPException(status_code=404, detail="账户不存在")
             before_status = user.status
+            if payload.expected_status is not None and payload.expected_status != before_status:
+                raise HTTPException(409, "账户状态已改变，请刷新后重新核查")
             revoked_keys = 0
             if payload.action == "freeze":
                 if before_status != "frozen":
@@ -1540,6 +2046,18 @@ def create_app(
                 ).limit(1))
                 if unresolved_refund_risk is not None:
                     raise HTTPException(status_code=409, detail="退款风险债务尚未处置，禁止解除冻结")
+                unresolved_chargeback = session.scalar(select(PaymentChargeback.id).where(
+                    PaymentChargeback.user_id == user_id,
+                    PaymentChargeback.status.in_(("risk", "pending_reconciliation")),
+                ).limit(1))
+                if unresolved_chargeback is not None:
+                    raise HTTPException(status_code=409, detail="拒付差额或待对账尚未处置，禁止解除冻结")
+                from .models import PaymentChargebackReturn
+                if session.scalar(select(PaymentChargebackReturn.id).where(
+                    PaymentChargebackReturn.user_id == user_id,
+                    PaymentChargebackReturn.status == "pending_reconciliation",
+                ).limit(1)):
+                    raise HTTPException(status_code=409, detail="拒付返还尚待对账，禁止解除冻结")
                 user.status = "active"
                 after_status = "active"
             # Unfreezing deliberately does not restore sessions or API keys;
@@ -1970,6 +2488,7 @@ def create_app(
                         allowed_statuses=("pending_reconciliation",),
                         final_status="reconciled_released",
                         ledger_kind="operator_release",
+                        attempt_id=request_record.final_attempt_id,
                     )
                 else:
                     settlement_response = {
@@ -1989,6 +2508,8 @@ def create_app(
                         fallback_count=request_record.fallback_count,
                         upstream_cost_override=payload.upstream_cost_microusd,
                         allowed_statuses=("pending_reconciliation",),
+                        attempt_id=request_record.final_attempt_id,
+                        allow_budget_overrun=True,
                     )
             except BillingError as exc:
                 session.rollback()
@@ -2014,5 +2535,6 @@ def create_app(
         app.add_middleware(
             VercelIngressMiddleware,
             proxy_secret=settings.trusted_proxy_secret,
+            ops_ingress_secret=settings.ops_ingress_secret,
         )
     return app

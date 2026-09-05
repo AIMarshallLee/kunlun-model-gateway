@@ -7,26 +7,86 @@ from ipaddress import ip_network
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
+
+from sqlalchemy.dialects.postgresql.psycopg import PGDialect_psycopg
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 
 TURNSTILE_SITEVERIFY_ENDPOINT = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 SUPPORTED_ENVIRONMENTS = frozenset({"development", "test", "staging", "production"})
 LEGACY_OPERATOR_ENVIRONMENTS = frozenset({"development", "test"})
+BYOK_PROVIDER_ENDPOINTS: dict[str, tuple[str, frozenset[str]]] = {
+    "openai": ("api.openai.com", frozenset({"/v1"})),
+    "deepseek": ("api.deepseek.com", frozenset({"", "/v1"})),
+    "google": (
+        "generativelanguage.googleapis.com",
+        frozenset({"/v1beta/openai"}),
+    ),
+}
+BYOK_PROVIDER_CATALOG = frozenset(BYOK_PROVIDER_ENDPOINTS)
+
+
+def validate_byok_provider_endpoint(name: str, base_url: str) -> None:
+    """Bind every BYOK provider name to its reviewed official endpoint."""
+    expected = BYOK_PROVIDER_ENDPOINTS.get(name.strip().casefold())
+    try:
+        parsed = urlparse(base_url.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("BYOK Provider 官方端点无效") from exc
+    normalized_path = parsed.path.rstrip("/")
+    if (
+        expected is None
+        or parsed.scheme != "https"
+        or (parsed.hostname or "").casefold() != expected[0]
+        or port not in {None, 443}
+        or normalized_path not in expected[1]
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("BYOK Provider 必须使用已审核的官方兼容端点")
 
 
 def _production_database_url_is_safe(value: str) -> bool:
-    """Require authenticated PostgreSQL TLS for every production process."""
+    """Require one unambiguous authenticated PostgreSQL TLS connection.
+
+    psycopg accepts libpq connection parameters in a URL query string.  Some
+    of them override the authority component, so validating only ``urlparse``
+    would validate a different target than the driver connects to.  Production
+    accepts exactly the two TLS parameters below and then compares the parsed
+    authority to SQLAlchemy's real psycopg connect arguments.
+    """
     try:
         parsed = urlparse(value)
-        query = [(key.casefold(), item) for key, item in parse_qsl(
-            parsed.query, keep_blank_values=True,
-        )]
-        ssl_modes = [item.casefold() for key, item in query if key == "sslmode"]
-        root_certs = [item for key, item in query if key == "sslrootcert"]
-        certificate = Path(root_certs[0]) if len(root_certs) == 1 else None
+        query = [
+            (key.casefold(), item)
+            for key, item in parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+        ]
+        allowed_query_keys = {"sslmode", "sslrootcert"}
+        query_keys = [key for key, _item in query]
+        if (
+            len(query_keys) != len(set(query_keys))
+            or set(query_keys) != allowed_query_keys
+        ):
+            return False
+        query_values = dict(query)
+        certificate = Path(query_values["sslrootcert"])
+        connect_args, connect_kwargs = PGDialect_psycopg().create_connect_args(make_url(value))
+        expected_connect_values = {
+            "user": unquote(parsed.username or ""),
+            "password": unquote(parsed.password or ""),
+            "host": parsed.hostname or "",
+            "dbname": _database_name(value),
+            "sslmode": "verify-full",
+            "sslrootcert": query_values["sslrootcert"],
+        }
         return bool(
             parsed.scheme == "postgresql+psycopg"
             and parsed.hostname
@@ -34,14 +94,72 @@ def _production_database_url_is_safe(value: str) -> bool:
             and parsed.password
             and parsed.path not in {"", "/"}
             and not parsed.fragment
-            and ssl_modes == ["verify-full"]
-            and certificate is not None
+            and query_values["sslmode"].casefold() == "verify-full"
             and certificate.is_absolute()
             and certificate.is_file()
             and os.access(certificate, os.R_OK)
+            and not connect_args
+            and all(
+                connect_kwargs.get(name) == expected
+                for name, expected in expected_connect_values.items()
+            )
+            and connect_kwargs.get("port") == parsed.port
         )
-    except (TypeError, ValueError, OSError):
+    except (SQLAlchemyError, TypeError, ValueError, OSError):
         return False
+
+
+def _database_password(value: str) -> str:
+    """Return only a decoded password for equality checks; never log it."""
+    try:
+        return unquote(urlparse(value).password or "")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _database_user(value: str) -> str:
+    """Normalize only Supavisor's documented role.project-ref usernames."""
+    try:
+        parsed = urlparse(value)
+        username = unquote(parsed.username or "")
+        hostname = (parsed.hostname or "").casefold()
+    except (TypeError, ValueError):
+        return ""
+    if hostname.endswith(".pooler.supabase.com"):
+        role, separator, project_ref = username.rpartition(".")
+        if separator and role and re.fullmatch(r"[a-z0-9]{20}", project_ref):
+            return role
+    return username
+
+
+def _database_name(value: str) -> str:
+    """Return a single, decoded PostgreSQL database name."""
+    try:
+        path = urlparse(value).path
+    except (TypeError, ValueError):
+        return ""
+    if not path.startswith("/") or "/" in path[1:]:
+        return ""
+    name = unquote(path[1:])
+    return name if name and "/" not in name else ""
+
+
+def _supabase_project_ref(value: str) -> str:
+    """Identify one managed Supabase project through direct or pooler URLs."""
+    try:
+        parsed = urlparse(value)
+        hostname = (parsed.hostname or "").casefold()
+        username = unquote(parsed.username or "")
+    except (TypeError, ValueError):
+        return ""
+    direct = re.fullmatch(r"db\.([a-z0-9]{20})\.supabase\.co", hostname)
+    if direct:
+        return direct.group(1)
+    if hostname.endswith(".pooler.supabase.com"):
+        _role, separator, project_ref = username.rpartition(".")
+        if separator and re.fullmatch(r"[a-z0-9]{20}", project_ref):
+            return project_ref
+    return ""
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -77,6 +195,11 @@ class Settings:
     enable_test_payments: bool = False
     live_payments: bool = False
     live_upstream: bool = False
+    gateway_mode: str = "legacy_test"
+    platform_daily_budget_microusd: int = 0
+    supplier_use_acknowledged: bool = False
+    vault_backend: str = "disabled"
+    vault_executor_database_url: str = ""
     payment_webhook_secret: str = ""
     api_key_pepper: str = field(default_factory=lambda: secrets.token_hex(32))
     session_pepper: str = field(default_factory=lambda: secrets.token_hex(32))
@@ -102,6 +225,8 @@ class Settings:
     ingress_provider: str = ""
     cron_secret: str = ""
     cron_secret_persisted: bool = False
+    ops_ingress_secret: str = ""
+    ops_ingress_secret_persisted: bool = False
     content_safety_required: bool = False
     content_safety_endpoint: str = ""
     content_safety_api_key: str = ""
@@ -169,6 +294,9 @@ class Settings:
             "KUNLUN_TRUSTED_PROXY_SECRET"
         )
         cron_secret, cron_secret_persisted = _env_secret("CRON_SECRET")
+        ops_ingress_secret, ops_ingress_secret_persisted = _env_secret(
+            "KUNLUN_OPS_INGRESS_SECRET"
+        )
         values: dict[str, Any] = {
             "database_url": os.getenv("KUNLUN_DATABASE_URL", "sqlite:///./kunlun-gateway.sqlite3"),
             "environment": os.getenv("KUNLUN_ENV", "development"),
@@ -176,6 +304,11 @@ class Settings:
             "enable_test_payments": _env_bool("KUNLUN_ENABLE_TEST_PAYMENTS"),
             "live_payments": _env_bool("KUNLUN_LIVE_PAYMENTS"),
             "live_upstream": _env_bool("KUNLUN_LIVE_UPSTREAM"),
+            "gateway_mode": os.getenv("KUNLUN_GATEWAY_MODE", "legacy_test"),
+            "platform_daily_budget_microusd": int(os.getenv("KUNLUN_PLATFORM_DAILY_BUDGET_MICROUSD", "0")),
+            "supplier_use_acknowledged": os.getenv("KUNLUN_SUPPLIER_USE_ACKNOWLEDGED", "false").lower() == "true",
+            "vault_backend": os.getenv("KUNLUN_VAULT_BACKEND", "disabled"),
+            "vault_executor_database_url": os.getenv("KUNLUN_VAULT_EXECUTOR_DATABASE_URL", ""),
             "payment_webhook_secret": os.getenv("KUNLUN_PAYMENT_WEBHOOK_SECRET", ""),
             "api_key_pepper": api_key_pepper or secrets.token_hex(32),
             "session_pepper": session_pepper or secrets.token_hex(32),
@@ -209,6 +342,8 @@ class Settings:
             "ingress_provider": os.getenv("KUNLUN_INGRESS_PROVIDER", ""),
             "cron_secret": cron_secret,
             "cron_secret_persisted": cron_secret_persisted,
+            "ops_ingress_secret": ops_ingress_secret,
+            "ops_ingress_secret_persisted": ops_ingress_secret_persisted,
             "content_safety_required": _env_bool("KUNLUN_CONTENT_SAFETY_REQUIRED"),
             "content_safety_endpoint": os.getenv("KUNLUN_CONTENT_SAFETY_ENDPOINT", ""),
             "content_safety_api_key": safety_key,
@@ -280,6 +415,11 @@ class Settings:
             raise RuntimeError(
                 "KUNLUN_ENV 必须是 development、test、staging 或 production"
             )
+        # A Vercel production deployment must not silently boot using the
+        # development defaults when its project environment variables are
+        # incomplete or mis-scoped.
+        if os.getenv("VERCEL_ENV", "").strip().casefold() == "production" and self.environment != "production":
+            raise RuntimeError("Vercel production deployment 必须显式设置 KUNLUN_ENV=production")
         if self.operator_token and self.environment == "staging":
             raise RuntimeError("KUNLUN_OPERATOR_TOKEN 仅允许在 development/test 环境兼容使用")
         if self.environment == "staging" and any(
@@ -290,6 +430,81 @@ class Settings:
             )
         if self.environment != "production" and (self.live_upstream or self.live_payments):
             raise RuntimeError("真实模型上游与真实支付仅允许在 production 环境开启")
+        self.gateway_mode = str(self.gateway_mode).strip().casefold()
+        self.vault_backend = str(self.vault_backend).strip().casefold()
+        if self.gateway_mode not in {"disabled", "byok", "legacy_test", "managed_gateway"}:
+            raise RuntimeError("KUNLUN_GATEWAY_MODE 仅支持 disabled、byok、managed_gateway 或 legacy_test")
+        if self.gateway_mode == "managed_gateway":
+            if not 1 <= self.platform_daily_budget_microusd <= 1_000_000_000_000:
+                raise RuntimeError("平台模式必须配置正整数 KUNLUN_PLATFORM_DAILY_BUDGET_MICROUSD")
+            if self.environment not in {"production", "test"}:
+                raise RuntimeError("平台商业模式仅允许 production 或显式注入适配器的 test")
+            if not self.require_email_verification:
+                raise RuntimeError("平台商业模式必须启用邮箱验证")
+            if self.is_production and (not self.live_upstream or not self.supplier_use_acknowledged):
+                raise RuntimeError("平台商业模式必须明确启用上游并确认供应商商业用途依据")
+            if not isinstance(self.providers, list) or not 1 <= len(self.providers) <= 3:
+                raise RuntimeError("平台首发目录必须包含 1 到 3 个允许渠道")
+            seen_providers = set()
+            for provider in self.providers:
+                if not isinstance(provider, dict) or set(provider) - {"name", "base_url", "models", "pricing"}:
+                    raise RuntimeError("平台模型目录仅允许模型、端点和价格，不接受内联密钥或 api_key_env")
+                name = provider.get("name")
+                if not isinstance(name, str) or name not in BYOK_PROVIDER_CATALOG or name in seen_providers:
+                    raise RuntimeError("平台渠道名称必须来自允许目录且不得重复")
+                seen_providers.add(name)
+                if not isinstance(provider.get("base_url"), str):
+                    raise RuntimeError("平台渠道必须配置官方端点")
+                validate_byok_provider_endpoint(name, provider["base_url"])
+                models = provider.get("models")
+                if not isinstance(models, list) or not models or any(not isinstance(m, str) or m not in self.models for m in models) or len(set(models)) != len(models):
+                    raise RuntimeError("平台渠道模型必须来自售卖目录且不得重复")
+                pricing = provider.get("pricing")
+                fields = {"input_microusd_per_million", "output_microusd_per_million"}
+                if not isinstance(pricing, dict) or set(pricing) != set(models):
+                    raise RuntimeError("平台渠道必须为每个模型配置成本价格")
+                for prices in pricing.values():
+                    if not isinstance(prices, dict) or set(prices) != fields or any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 1_000_000_000_000 for v in prices.values()):
+                        raise RuntimeError("平台渠道成本价格必须为非负整数 microUSD")
+        if self.environment in {"staging", "production"} and self.gateway_mode == "legacy_test":
+            raise RuntimeError("staging/production 环境禁止 KUNLUN_GATEWAY_MODE=legacy_test")
+        if (
+            self.gateway_mode in {"byok", "managed_gateway"}
+            and os.getenv("VERCEL_ENV", "").strip().casefold() not in {"", "production"}
+        ):
+            raise RuntimeError("Vercel Preview/Development deployment 禁止启用 BYOK")
+        if self.vault_backend not in {"disabled", "supabase_vault"}:
+            raise RuntimeError("KUNLUN_VAULT_BACKEND 仅支持 disabled 或 supabase_vault")
+        if self.gateway_mode in {"byok", "managed_gateway"} and self.is_production and self.vault_backend != "supabase_vault":
+            raise RuntimeError("production BYOK 必须配置 Supabase Vault")
+        if self.gateway_mode in {"byok", "managed_gateway"} and self.is_production:
+            runtime_user = _database_user(self.database_url)
+            executor_user = _database_user(self.vault_executor_database_url)
+            if not _production_database_url_is_safe(self.vault_executor_database_url):
+                raise RuntimeError("production BYOK 必须配置 verify-full KUNLUN_VAULT_EXECUTOR_DATABASE_URL")
+            if executor_user != "kunlun_vault_executor":
+                raise RuntimeError("KUNLUN_VAULT_EXECUTOR_DATABASE_URL 必须使用 kunlun_vault_executor")
+            if runtime_user != "kunlun_runtime" or runtime_user == executor_user:
+                raise RuntimeError("runtime 与 Vault executor 必须是独立数据库角色")
+            if _database_password(self.database_url) == _database_password(self.vault_executor_database_url):
+                raise RuntimeError("KUNLUN_DATABASE_URL 与 KUNLUN_VAULT_EXECUTOR_DATABASE_URL 数据库凭据不得重复")
+            runtime_project = _supabase_project_ref(self.database_url)
+            executor_project = _supabase_project_ref(self.vault_executor_database_url)
+            if (
+                not runtime_project
+                or not secrets.compare_digest(runtime_project, executor_project)
+                or _database_name(self.database_url) != _database_name(self.vault_executor_database_url)
+            ):
+                raise RuntimeError(
+                    "runtime 与 Vault executor 必须连接同一可识别的 Supabase project/database"
+                )
+        if self.gateway_mode not in {"byok", "managed_gateway"} and self.vault_backend != "disabled":
+            raise RuntimeError("仅 BYOK 模式允许配置 Credential Vault")
+        if self.gateway_mode == "byok" and self.environment not in {"production", "test"}:
+            raise RuntimeError("BYOK 仅允许在 production 或 test 环境运行")
+        if self.gateway_mode in {"byok", "managed_gateway"} and (not self.providers or not self.provider_host_allowlist):
+            raise RuntimeError("BYOK 必须配置服务端 Provider 目录和主机允许列表")
+        upstream_active = self.live_upstream or self.gateway_mode in {"byok", "managed_gateway"}
         if self.rate_limit_per_minute < 1:
             raise RuntimeError("rate_limit_per_minute 必须大于 0")
         if not 1 <= self.checkout_rate_limit_per_minute <= 60:
@@ -362,12 +577,34 @@ class Settings:
                 or any(ord(char) < 33 or ord(char) > 126 for char in self.cron_secret)
             ):
                 missing_vercel.append("持久化 CRON_SECRET")
+            if (
+                len(self.ops_ingress_secret) < 32
+                or not self.ops_ingress_secret_persisted
+                or any(ord(char) < 33 or ord(char) > 126 for char in self.ops_ingress_secret)
+            ):
+                missing_vercel.append("持久化 KUNLUN_OPS_INGRESS_SECRET")
+            if (
+                len(self.operator_signing_secret) < 32
+                or not self.operator_signing_secret_persisted
+                or any(ord(char) < 33 or ord(char) > 126 for char in self.operator_signing_secret)
+            ):
+                missing_vercel.append("持久化 KUNLUN_OPERATOR_SIGNING_SECRET")
+            configured_secrets = {
+                "KUNLUN_TRUSTED_PROXY_SECRET": self.trusted_proxy_secret,
+                "CRON_SECRET": self.cron_secret,
+                "KUNLUN_OPS_INGRESS_SECRET": self.ops_ingress_secret,
+            }
+            configured_secrets["KUNLUN_OPERATOR_SIGNING_SECRET"] = self.operator_signing_secret
+            values_by_name = list(configured_secrets.items())
+            for index, (name, value) in enumerate(values_by_name):
+                if value and any(value == other for _other_name, other in values_by_name[index + 1:]):
+                    missing_vercel.append(f"{name} 必须与其他 Vercel/运维密钥不同")
             if missing_vercel:
                 raise RuntimeError("Vercel ingress 配置不完整: " + ", ".join(missing_vercel))
-        if self.live_upstream:
+        if upstream_active:
             configured_hosts = {
                 (urlparse(str(provider.get("base_url") or "")).hostname or "").casefold()
-                for provider in self.providers
+                for provider in self.providers if isinstance(provider, dict)
             }
             unexpected = sorted(configured_hosts - self.provider_host_allowlist)
             if unexpected:
@@ -402,6 +639,18 @@ class Settings:
                 raise RuntimeError("正式支付适配器配置或官方 SDK 确认不完整")
         if self.is_production:
             missing = []
+            if self.gateway_mode not in {"disabled", "byok", "managed_gateway"}:
+                missing.append("production 仅允许 KUNLUN_GATEWAY_MODE=byok 或 disabled")
+            if self.public_signup and self.gateway_mode != "managed_gateway":
+                missing.append("关闭 KUNLUN_PUBLIC_SIGNUP（production 不提供公共注册）")
+            if self.enable_test_payments:
+                missing.append("关闭 KUNLUN_ENABLE_TEST_PAYMENTS")
+            if self.live_payments and self.gateway_mode != "managed_gateway":
+                missing.append("关闭 KUNLUN_LIVE_PAYMENTS（BYOK 产品不提供充值）")
+            if self.topup_packages and self.gateway_mode != "managed_gateway":
+                missing.append("清空 KUNLUN_TOPUP_PACKAGES_JSON（BYOK 产品不提供余额或充值套餐）")
+            if self.gateway_mode == "byok" and self.live_upstream:
+                missing.append("BYOK 必须关闭 KUNLUN_LIVE_UPSTREAM（禁止服务端共享上游密钥）")
             if self.operator_token:
                 missing.append("KUNLUN_OPERATOR_TOKEN 仅允许在 development/test 环境兼容使用")
             if not _production_database_url_is_safe(self.database_url):
@@ -420,8 +669,6 @@ class Settings:
                 missing.append("KUNLUN_IDENTITY_TOKEN_PEPPER")
             elif (self.public_signup or self.require_email_verification) and not self.identity_token_pepper_persisted:
                 missing.append("持久化 KUNLUN_IDENTITY_TOKEN_PEPPER")
-            if self.enable_test_payments:
-                missing.append("关闭 KUNLUN_ENABLE_TEST_PAYMENTS")
             if not self.trusted_proxy_cidrs and not self.trusted_proxy_secret:
                 missing.append(
                     "可信反向代理 KUNLUN_TRUSTED_PROXY_CIDRS/KUNLUN_TRUSTED_PROXY_SECRET"
@@ -460,7 +707,7 @@ class Settings:
                         missing.append(label)
                 if not self.compliance_acknowledged:
                     missing.append("KUNLUN_COMPLIANCE_ACKNOWLEDGED")
-            if self.public_signup and self.live_upstream:
+            if self.public_signup and upstream_active:
                 if not self.content_safety_required:
                     missing.append("KUNLUN_CONTENT_SAFETY_REQUIRED")
                 if not self.content_safety_endpoint or not self.content_safety_api_key or not self.content_safety_host_allowlist:
@@ -470,15 +717,16 @@ class Settings:
                     missing.append("持久化 KUNLUN_OPERATOR_SIGNING_SECRET")
                 if not self.ops_private_access_acknowledged:
                     missing.append("KUNLUN_OPS_PRIVATE_ACCESS_ACKNOWLEDGED")
-            elif self.live_upstream or self.live_payments:
+            elif upstream_active or self.live_payments:
                 missing.append("KUNLUN_OPERATOR_SIGNING_SECRET")
-            if (self.live_upstream or self.live_payments) and not self.ops_private_access_acknowledged:
+            if (upstream_active or self.live_payments) and not self.ops_private_access_acknowledged:
                 missing.append("KUNLUN_OPS_PRIVATE_ACCESS_ACKNOWLEDGED")
-            if self.live_upstream:
+            if upstream_active:
                 if not self.model_catalog_explicit:
                     missing.append("显式 KUNLUN_MODELS_JSON（禁止生产使用内置 test-model）")
                 catalog_models = set(self.models)
                 routed_models: set[str] = set()
+                provider_names: set[str] = set()
                 price_fields = {
                     "input_microusd_per_million",
                     "output_microusd_per_million",
@@ -488,6 +736,35 @@ class Settings:
                         missing.append(f"Provider {index + 1} 显式模型列表与完整上游价格")
                         continue
                     provider_name = str(provider.get("name") or f"provider-{index + 1}")
+                    normalized_provider_name = provider_name.strip().casefold()
+                    if normalized_provider_name in provider_names:
+                        missing.append(f"Provider 名称重复: {provider_name}")
+                    provider_names.add(normalized_provider_name)
+                    if self.gateway_mode in {"byok", "managed_gateway"}:
+                        parsed_provider_url = urlparse(str(provider.get("base_url") or ""))
+                        if normalized_provider_name not in BYOK_PROVIDER_CATALOG:
+                            missing.append(f"BYOK Provider 不在允许目录: {provider_name}")
+                        if provider.get("api_key_env"):
+                            missing.append(f"BYOK Provider {provider_name} 禁止 api_key_env 或共享密钥")
+                        if (
+                            parsed_provider_url.scheme != "https"
+                            or not parsed_provider_url.hostname
+                            or parsed_provider_url.username
+                            or parsed_provider_url.password
+                            or parsed_provider_url.query
+                            or parsed_provider_url.fragment
+                        ):
+                            missing.append(f"BYOK Provider {provider_name} 必须使用固定 HTTPS 地址")
+                        else:
+                            try:
+                                validate_byok_provider_endpoint(
+                                    normalized_provider_name,
+                                    str(provider.get("base_url") or ""),
+                                )
+                            except RuntimeError:
+                                missing.append(
+                                    f"BYOK Provider {provider_name} 必须绑定已审核的官方兼容端点"
+                                )
                     raw_models = provider.get("models")
                     if not isinstance(raw_models, list) or not raw_models:
                         missing.append(f"Provider {provider_name} 显式模型列表")
@@ -513,6 +790,20 @@ class Settings:
                             )
                         ):
                             missing.append(f"Provider {provider_name} 模型 {model} 完整上游价格")
+                        elif self.gateway_mode == "byok" and model in self.models:
+                            # The catalog is a pre-authorisation ceiling, not
+                            # an indicative retail price.  A provider route
+                            # that can exceed it must never start in prod.
+                            catalog_price = self.models[model]
+                            if (
+                                prices["input_microusd_per_million"]
+                                > catalog_price["input_microusd_per_million"]
+                                or prices["output_microusd_per_million"]
+                                > catalog_price["output_microusd_per_million"]
+                            ):
+                                missing.append(
+                                    f"BYOK Provider {provider_name} 模型 {model} 上游价格超过 KUNLUN_MODELS_JSON 预授权上限"
+                                )
                 unrouted = sorted(catalog_models - routed_models)
                 if unrouted:
                     missing.append("模型目录存在无供应商路由: " + ", ".join(unrouted))
