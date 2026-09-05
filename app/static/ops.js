@@ -49,12 +49,14 @@ function setActionBusy(value) {
   document.querySelectorAll("#action-form input, #action-form textarea, #action-form select, #action-form button").forEach((element) => { element.disabled = value; });
   byId("cancel").disabled = value;
   byId("channel-operation-lookup").querySelectorAll("input,button").forEach((element) => { element.disabled = value; });
+  byId("key-history").querySelectorAll("input,button").forEach((element) => { element.disabled = value; });
 }
 function cancelCommand() { command = null; commandSecret = ""; byId("confirmation").hidden = true; byId("command-preview").textContent = ""; }
 function clearSelection() {
   selected = null; actions = []; cancelCommand();
   byId("snapshot").textContent = ""; byId("result").textContent = "";
   byId("object-facts").replaceChildren();
+  byId("key-history").hidden = true; byId("key-filter").reset(); byId("key-page").textContent = "";
   byId("alert-context").hidden = true;
   byId("chargeback-context").hidden = true; byId("chargeback-state").textContent = "";
   byId("return-context").hidden = true; byId("return-state").textContent = "";
@@ -93,6 +95,7 @@ function renderChrome() {
   renderActions();
 }
 function renderFacts() {
+  byId("key-history").hidden = selected?.kind !== "accounts";
   if (!selected) return;
   const {data, kind} = selected, row = data.account || data.order || data.request || data.model || data.alert || data.chargeback || data.return || data.channel;
   const facts = [[say("Object ID", "对象 ID"), row.id], [say("Status", "状态"), kind === "models" ? (row.active ? say("Listed", "已上架") : say("Unlisted", "已下架")) : row.status]];
@@ -171,12 +174,20 @@ function renderFacts() {
     [say("Output token limit", "输出 Token 上限"), row.max_output_tokens],
     [say("Effective at (UTC)", "生效时间（UTC）"), row.effective_at],
   );
-  if (kind === "accounts") facts.push(
+  if (kind === "accounts") {
+    const pagination = data.keys_pagination;
+    byId("key-history").hidden = false;
+    byId("key-id-filter").value = selected.keyId || "";
+    byId("key-page").textContent = `${pagination.total ? pagination.offset + 1 : 0}–${pagination.offset + data.keys.length} / ${pagination.total}`;
+    byId("key-previous").disabled = executing || pagination.offset === 0;
+    byId("key-next").disabled = executing || pagination.offset + data.keys.length >= pagination.total;
+    facts.push(
     [say("Customer", "客户"), row.email], [say("Email verified", "邮箱已验证"), row.email_verified_at ? say("Yes", "是") : say("No", "否")],
     [say("Available credit", "可用额度"), `${data.wallet?.balance_microusd ?? "—"} microUSD`],
     [say("Reserved credit", "占用额度"), `${data.wallet?.reserved_microusd ?? "—"} microUSD`],
     ["Keys", data.keys.map((key) => `${key.name} · ${key.status} · ••••${key.last_four}`).join(" / ") || "—"],
   );
+  }
   if (kind === "orders") facts.push(
     [say("Customer ID", "客户 ID"), row.user_id], [say("Purchased credit", "购买额度"), `${row.credit_amount_microusd} microUSD`],
     [say("Cash amount (minor units)", "实付金额（最小货币单位）"), `${row.payment_amount_minor ?? "—"} ${row.payment_currency ?? "—"}`],
@@ -243,14 +254,18 @@ async function navigateRelated(destinationId, objectId, orderFilter) {
   active = destination; offset = 0; returnOrderFilter = orderFilter;
   if (await load() && objectId) await inspect(objectId);
 }
-async function inspect(id) {
+async function inspect(id, {keyOffset = 0, keyId = ""} = {}) {
   if (!active?.detail || executing) return;
+  if (active.id === "accounts" && keyId && !/^[A-Za-z0-9_-]{1,64}$/.test(keyId)) {
+    notice(say("Enter a Key ID, not the full API key.", "请输入 Key ID，不要输入完整 API 密钥。")); return;
+  }
   const current = ++epoch; clearSelection(); notice(""); byId("object-id").value = id;
   try {
-    const response = await client.request(active.detail + encodeURIComponent(id));
+    const query = active.id === "accounts" ? "?" + new URLSearchParams({key_limit: "20", key_offset: String(keyOffset), ...(keyId ? {key_id: keyId} : {})}) : "";
+    const response = await client.request(active.detail + encodeURIComponent(id) + query);
     if (current !== epoch) return;
     const data = active.id === "chargebacks" ? {chargeback: response} : active.id === "returns" ? {return: response} : response;
-    selected = {id, kind: active.id, data}; showJSON("snapshot", data); renderFacts(); renderActions();
+    selected = {id, kind: active.id, data, keyId}; showJSON("snapshot", data); renderFacts(); renderActions();
     if (selected.kind === "channels") {
       const card = [...byId("records").children].find((element) => element.dataset.channelProvider === data.channel.provider);
       if (card) card.querySelector("small").textContent = `${data.channel.status} · v${data.channel.version}`;
@@ -386,6 +401,19 @@ byId("refresh").addEventListener("click", load);
 byId("previous").addEventListener("click", () => { offset = Math.max(0, offset - 20); load(); });
 byId("next").addEventListener("click", () => { offset += 20; load(); });
 byId("lookup").addEventListener("submit", (event) => { event.preventDefault(); inspect(byId("object-id").value.trim()); });
+byId("key-filter").addEventListener("submit", (event) => {
+  event.preventDefault(); if (executing || selected?.kind !== "accounts") return;
+  inspect(selected.id, {keyId: byId("key-id-filter").value.trim()});
+});
+byId("key-id-filter").addEventListener("input", cancelCommand);
+byId("key-filter-clear").addEventListener("click", () => {
+  if (!executing && selected?.kind === "accounts") inspect(selected.id);
+});
+for (const [id, direction] of [["key-previous", -1], ["key-next", 1]]) byId(id).addEventListener("click", () => {
+  if (executing || selected?.kind !== "accounts") return;
+  const page = selected.data.keys_pagination;
+  inspect(selected.id, {keyOffset: Math.max(0, page.offset + direction * page.limit), keyId: selected.keyId});
+});
 byId("action").addEventListener("change", () => { cancelCommand(); byId("channel-secret").value = ""; renderActions(); });
 byId("reason").addEventListener("input", cancelCommand);
 byId("usage-fields").addEventListener("input", cancelCommand);

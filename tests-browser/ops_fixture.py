@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 from checkout_fixture import BrowserPaymentBridge
 from test_managed_gateway import OPS, managed, ready_call
-from app.models import ModelRequest, PaymentChargeback, PaymentChargebackReturn, User, Wallet
+from app.models import ApiKey, ModelRequest, PaymentChargeback, PaymentChargebackReturn, User, Wallet
 from app.services.payment_domain import PaymentDomainService
 from app.services.ledger import CUSTOMER_AVAILABLE, PLATFORM_CLEARING, post_transaction
 from app.services.ops_tokens import mint_operator_token
@@ -115,6 +115,17 @@ if __name__ == "__main__":
         class FakeSMTP:
             def send_operator_alert(self, *args): pass
         assert dispatch_digest(app.state.SessionLocal, notification, "synthetic-ops@example.invalid", FakeSMTP()) == "accepted"
+        key_history = None
+        if "--key-history" in sys.argv:
+            from datetime import datetime, timezone
+            with app.state.SessionLocal() as db:
+                owner = db.scalar(select(User.id).where(User.email == "managed@example.com"))
+                for i in range(205):
+                    db.add(ApiKey(id=f"history-{i:03}", user_id=owner, name=f"History {i}",
+                        status="active" if i == 204 else "revoked", secret_digest="inert-history-digest",
+                        last_four="test", created_at=datetime(2020, 1, 1, tzinfo=timezone.utc)))
+                db.commit()
+                key_history = {"user_id": owner, "old_key_id": "history-204"}
 
         @app.get("/__fixture__/operator")
         def operator(profile: str = "read"):
@@ -128,7 +139,8 @@ if __name__ == "__main__":
                 if profile == "channel_write":
                     scopes.add("channels:write")
             return {"token": mint_operator_token(OPS, subject="synthetic-operator", scopes=scopes, ttl_seconds=300),
-                    "requests": requests, "order_id": bridge.webhook.order_id, "chargebacks": chargebacks, "returns": returns}
+                    "requests": requests, "order_id": bridge.webhook.order_id, "chargebacks": chargebacks, "returns": returns,
+                    "key_history": key_history}
 
         @app.get("/__fixture__/refund-calls")
         def refund_calls():

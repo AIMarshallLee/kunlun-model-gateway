@@ -127,6 +127,10 @@ def main():
         raced = [result for future in pending if (result := future.result()) is not None]
         assert frozen.result()["status"] == "frozen"
     assert reserve(9000) is None, "a new admission crossed the committed key freeze"
+    from app.ops_console import account
+    key_page = account(user, request_context, key_limit=1, key_offset=0, key_id=key)
+    assert key_page["keys_pagination"] == {"limit": 1, "offset": 0, "total": 1}
+    assert key_page["keys"][0]["id"] == key and key_page["keys"][0]["status"] == "frozen"
     for reservation in raced:
         with Session(engine) as db:
             release_model_request(db, reservation.request_id, "ci_frozen_key_existing_hold")

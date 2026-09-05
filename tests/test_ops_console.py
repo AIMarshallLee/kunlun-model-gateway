@@ -10,6 +10,43 @@ def operator(*scopes):
     return {"X-Kunlun-Ops-Token": mint_operator_token(OPS, subject="inert-operator", scopes=set(scopes))}
 
 
+def test_account_key_history_is_paginated_filtered_and_scoped(managed):
+    client, auth, *_ = managed
+    from app.models import User
+    with client.app.state.SessionLocal() as db:
+        user_id = db.scalar(select(User.id))
+        for i in range(205):
+            db.add(ApiKey(id=f"history-{i:03}", user_id=user_id, name=f"History {i}",
+                          status="revoked", secret_digest="never-serialize-this-digest", last_four="test"))
+        db.add(User(id="history-other-user", email="history-other@example.invalid", password_hash="inert"))
+        db.flush()
+        db.add(ApiKey(id="another-user-key", user_id="history-other-user", name="Other account",
+                      secret_digest="inert-other-digest", last_four="test"))
+        db.commit()
+    path = f"/ops/accounts/{user_id}"
+    headers = operator("accounts:read")
+    first = client.get(path + "?key_limit=100&key_offset=0", headers=headers).json()
+    second = client.get(path + "?key_limit=100&key_offset=100", headers=headers).json()
+    last = client.get(path + "?key_limit=100&key_offset=200", headers=headers).json()
+    assert first["keys_pagination"] == {"limit": 100, "offset": 0, "total": 206}
+    assert len(first["keys"]) == len(second["keys"]) == 100 and len(last["keys"]) == 6
+    assert len({k["id"] for page in (first, second, last) for k in page["keys"]}) == 206
+    assert first["keys_truncated"] and not last["keys_truncated"]
+    filtered = client.get(path + "?key_id=history-000", headers=headers)
+    assert [k["id"] for k in filtered.json()["keys"]] == ["history-000"]
+    assert "never-serialize" not in filtered.text and "secret_digest" not in filtered.text
+    assert client.get(path + "?key_id=another-user-key", headers=headers).json()["keys"] == []
+    assert client.get(path + "?key_limit=20", headers=auth).status_code == 401
+    assert client.get(path + "?key_limit=20", headers=operator("console:read")).status_code == 401
+    assert client.get("/ops/accounts/missing?key_id=history-000", headers=headers).status_code == 404
+
+
+@pytest.mark.parametrize("query", ["key_limit=0", "key_limit=201", "key_offset=-1", "key_offset=1000001", "key_id=", "key_id=gw_example.not-an-id"])
+def test_account_key_pagination_rejects_invalid_bounds(managed, query):
+    client, *_ = managed
+    assert client.get("/ops/accounts/missing?" + query, headers=operator("accounts:read")).status_code == 422
+
+
 def test_customer_credentials_cannot_read_operator_data(managed):
     client, auth, *_ = managed
     for path in ("/ops/session", "/ops/accounts", "/ops/orders", "/ops/audit", "/ops/requests/missing"):

@@ -21,7 +21,10 @@ pre:empty { display:none; } #lookup { grid-template-columns:minmax(0,1fr) auto; 
 #object-facts { display:grid; grid-template-columns:minmax(100px,.6fr) minmax(0,1fr); gap:12px; font:13px/1.6 monospace; }
 #object-facts dt { color:var(--muted); } #object-facts dd { margin:0; overflow-wrap:anywhere; } details summary { cursor:pointer; font:13px monospace; color:var(--muted); }
 #return-filter { margin-bottom:16px; }
+#key-history { border-top:1px solid var(--line); padding:12px 0 18px; }
+#key-filter { grid-template-columns:minmax(0,1fr) auto auto; align-items:end; }
+.pager { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-top:16px; font:12px monospace; }
 #channel-operation-lookup { border-top:1px solid var(--line); padding-top:18px; margin-top:18px; }
 #usage-fields { display:grid; gap:12px; } #confirmation { border:1px solid var(--signal); padding:16px; margin-top:18px; } .danger { color:#ffc792; border-color:#c08146; }
 #notice { color:var(--signal); font:14px/1.6 monospace; overflow-wrap:anywhere; } footer { border-top:1px solid var(--line); padding-top:24px; margin-top:36px; }
-@media(max-width:760px) { .workspace { grid-template-columns:1fr; } header { padding:16px 5vw; } main { padding-top:24px; } #lookup { grid-template-columns:1fr; } }
+@media(max-width:760px) { .workspace { grid-template-columns:1fr; } header { padding:16px 5vw; } main { padding-top:24px; } #lookup,#key-filter { grid-template-columns:1fr; } }

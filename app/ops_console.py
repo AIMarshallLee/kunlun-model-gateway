@@ -60,20 +60,28 @@ def accounts(request: Request, limit: int = Query(50, ge=1, le=200), offset: int
 
 
 @router.get("/ops/accounts/{user_id}")
-def account(user_id: str, request: Request, _operator=Depends(require_operator_scope("accounts:read"))):
+def account(user_id: str, request: Request, key_limit: int = Query(100, ge=1, le=200),
+            key_offset: int = Query(0, ge=0, le=1_000_000),
+            key_id: str | None = Query(None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+            _operator=Depends(require_operator_scope("accounts:read"))):
     with request.app.state.SessionLocal() as db:
         user = db.get(User, user_id)
         if user is None:
             raise HTTPException(404, "Account not found")
         wallet = db.get(Wallet, user_id)
-        keys = db.scalars(select(ApiKey).where(ApiKey.user_id == user_id).order_by(ApiKey.created_at.desc(), ApiKey.id).limit(101)).all()
-        usage = key_usage(db, user_id)
+        query = select(ApiKey).where(ApiKey.user_id == user_id)
+        if key_id is not None:
+            query = query.where(ApiKey.id == key_id)
+        total = int(db.scalar(select(func.count()).select_from(query.subquery())) or 0)
+        keys = db.scalars(query.order_by(ApiKey.created_at.desc(), ApiKey.id).offset(key_offset).limit(key_limit)).all()
+        usage = key_usage(db, user_id, key_id)
         return {"account": project(user, ACCOUNT_FIELDS),
                 "wallet": project(wallet, ("balance_microusd", "reserved_microusd", "currency")) if wallet else None,
                 "keys": [{**project(key, ("id", "name", "last_four", "status", "max_output_tokens", "spend_limit_microusd")),
                           "allowed_models": json.loads(key.allowed_models_json) if key.allowed_models_json else None,
-                          **usage.get(key.id, {"spent_microusd": 0, "reserved_microusd": 0})} for key in keys[:100]],
-                "keys_truncated": len(keys) > 100}
+                          **usage.get(key.id, {"spent_microusd": 0, "reserved_microusd": 0})} for key in keys],
+                "keys_truncated": key_offset + len(keys) < total,
+                "keys_pagination": {"limit": key_limit, "offset": key_offset, "total": total}}
 
 
 @router.get("/ops/orders")
