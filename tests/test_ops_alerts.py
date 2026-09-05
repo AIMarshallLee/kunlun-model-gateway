@@ -38,6 +38,25 @@ def test_healthy_injected_supply_has_no_alert_and_does_not_call_model(managed):
     assert managed[-1] == []
 
 
+def test_chargeback_risk_enters_existing_alerts_without_becoming_resolved_on_ack(managed):
+    from app.models import PaymentChargeback, User
+    from app.services.payment_domain import PaymentDomainService
+    from tests.test_chargebacks import paid_order, dispute
+    from app.services.alert_notifications import safe_rules
+    client, _, _ = ready_call(managed)
+    with client.app.state.SessionLocal() as db:
+        owner = db.scalar(select(User.id))
+        order = paid_order(db, owner)
+        # Partial cash debit cannot be mapped to credits automatically.
+        dispute(PaymentDomainService(db), order, amount=50)
+    current = alerts(client)["chargeback_risk"]
+    assert current["severity"] == "critical" and current["count"] == 1
+    assert safe_rules([current])[0]["rule"] == "chargeback_risk"
+    assert ack(client, current).status_code == 201
+    with client.app.state.SessionLocal() as db:
+        assert db.scalar(select(PaymentChargeback.status)) == "pending_reconciliation"
+
+
 def test_ack_is_a_receipt_not_resolution_or_wallet_release(managed):
     client, headers, payload = ready_call(managed)
     client.app.state.test_upstream = lambda request: httpx.Response(500, json={"error": "never log this private upstream detail"})

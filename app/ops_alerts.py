@@ -11,7 +11,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .auth import require_operator_scope
-from .models import ModelPrice, ModelRequest, OperatorAction, OutboxEvent, PaymentOrder, PaymentRefund, PlatformDailyBudget
+from .models import ModelPrice, ModelRequest, OperatorAction, OutboxEvent, PaymentChargeback, PaymentOrder, PaymentRefund, PlatformDailyBudget
 from .schemas import StrictModel
 from .security import as_utc, token_digest, utcnow
 from .services.credentials import SecretUnavailable
@@ -65,6 +65,8 @@ def collect_alerts(db, settings, vault, *, now=None):
               (PaymentRefund.claim_started_at <= now - timedelta(minutes=5))), "orders")
     group("payment_risk", "warning", PaymentOrder, PaymentOrder.risk_reason.is_not(None), "orders")
     group("refund_risk", "critical", PaymentRefund, PaymentRefund.status == "risk", "orders")
+    group("chargeback_risk", "critical", PaymentChargeback,
+          PaymentChargeback.status.in_(("risk", "pending_reconciliation")), "orders")
     period = now.date().isoformat()
     budget = db.get(PlatformDailyBudget, period)
     limit = min(budget.limit_microusd, settings.platform_daily_budget_microusd) if budget else settings.platform_daily_budget_microusd

@@ -46,6 +46,7 @@ from .models import (
     ModelPrice,
     ModelRequest,
     OperatorAction,
+    PaymentChargeback,
     PaymentOrder,
     PaymentRefund,
     ProviderConnection,
@@ -285,6 +286,8 @@ def create_app(
     app.include_router(delivery_router)
     app.include_router(managed_router)
     app.include_router(public_router)
+    from .chargeback_routes import router as chargeback_router
+    app.include_router(chargeback_router)
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -1174,6 +1177,7 @@ def create_app(
                     payment_currency=event.currency,
                     provider_transaction_id=event.provider_transaction_id,
                     provider_refund_id=event.provider_refund_id,
+                    provider_dispute_id=event.provider_dispute_id,
                 )
             except PaymentDomainError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -2033,6 +2037,12 @@ def create_app(
                 ).limit(1))
                 if unresolved_refund_risk is not None:
                     raise HTTPException(status_code=409, detail="退款风险债务尚未处置，禁止解除冻结")
+                unresolved_chargeback = session.scalar(select(PaymentChargeback.id).where(
+                    PaymentChargeback.user_id == user_id,
+                    PaymentChargeback.status.in_(("risk", "pending_reconciliation")),
+                ).limit(1))
+                if unresolved_chargeback is not None:
+                    raise HTTPException(status_code=409, detail="拒付差额或待对账尚未处置，禁止解除冻结")
                 user.status = "active"
                 after_status = "active"
             # Unfreezing deliberately does not restore sessions or API keys;

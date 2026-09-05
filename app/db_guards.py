@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import Engine, text
 
 
-SCHEMA_HEAD = "0015_key_policy"
+SCHEMA_HEAD = "0016_chargebacks"
 
 # Every application-owned table in the public schema.  Keep this allow-list
 # explicit: a Supabase deployment may contain unrelated extension tables that
@@ -28,6 +28,7 @@ KUNLUN_BUSINESS_TABLES = (
     "operator_actions",
     "provider_attempts",
     "payment_refunds",
+    "payment_chargebacks",
     "safety_audits",
     "model_prices",
     "auth_rate_limit_counters",

@@ -282,7 +282,7 @@ def test_upgrade_from_initial_to_production_hardening_on_sqlite(tmp_path):
         old_policy = connection.execute(text("SELECT allowed_models_json,max_output_tokens,spend_limit_microusd FROM api_keys WHERE id='old-key'")).one()
         assert tuple(old_policy) == (None, None, None)
     tables = set(inspect(engine).get_table_names())
-    assert {"payment_refunds", "safety_audits", "provider_connections", "credential_action_audits"}.issubset(tables)
+    assert {"payment_refunds", "payment_chargebacks", "safety_audits", "provider_connections", "credential_action_audits"}.issubset(tables)
     refund_columns = {item["name"] for item in inspect(engine).get_columns("payment_refunds")}
     assert "claim_started_at" in refund_columns
     payment_columns = {item["name"] for item in inspect(engine).get_columns("payment_orders")}
@@ -316,6 +316,22 @@ def test_upgrade_from_initial_to_production_hardening_on_sqlite(tmp_path):
         connection.execute(text("UPDATE api_keys SET spend_limit_microusd=100 WHERE id='old-key'"))
     with pytest.raises(RuntimeError, match="受限 API Key"):
         command.downgrade(cfg, "0014_managed_gateway")
+    # Empty chargeback migration can roll back first; key policy downgrade
+    # still fails closed. Restore head before testing chargeback preservation.
+    assert_schema_revision(engine, "0015_key_policy")
+    command.upgrade(cfg, "head")
+    from sqlalchemy.orm import Session
+    from app.models import PaymentOrder, PaymentChargeback
+    with Session(engine) as db:
+        db.add(PaymentOrder(id="cb-order", user_id="old-user", credit_amount_microusd=100,
+            provider="inert-test", payment_amount_minor=1, payment_currency="USD"))
+        db.flush()
+        db.add(PaymentChargeback(id="cb-record", order_id="cb-order", user_id="old-user", provider="inert-test",
+            provider_dispute_id="inert-dispute", payment_amount_minor=1, payment_currency="USD",
+            credit_amount_microusd=100, status="pending_reconciliation"))
+        db.commit()
+    with pytest.raises(RuntimeError, match="拒付记录必须保留"):
+        command.downgrade(cfg, "0015_key_policy")
     assert_schema_revision(engine, SCHEMA_HEAD)
 
 

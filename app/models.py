@@ -420,6 +420,32 @@ class PaymentRefund(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class PaymentChargeback(Base):
+    __tablename__ = "payment_chargebacks"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_dispute_id", name="uq_chargeback_provider_dispute"),
+        CheckConstraint("payment_amount_minor > 0 AND credit_amount_microusd > 0", name="chargeback_amount_positive"),
+        CheckConstraint("recovered_microusd >= 0 AND outstanding_microusd >= 0 AND written_off_microusd >= 0 AND recovered_microusd + outstanding_microusd + written_off_microusd <= credit_amount_microusd", name="chargeback_credit_bounds"),
+        CheckConstraint("status IN ('recovered', 'risk', 'pending_reconciliation', 'resolved')", name="chargeback_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    order_id: Mapped[str] = mapped_column(ForeignKey("payment_orders.id", ondelete="RESTRICT"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    provider: Mapped[str] = mapped_column(String(32))
+    provider_dispute_id: Mapped[str] = mapped_column(String(120))
+    payment_amount_minor: Mapped[int] = mapped_column(BigInteger)
+    payment_currency: Mapped[str] = mapped_column(String(3))
+    credit_amount_microusd: Mapped[int] = mapped_column(BigInteger)
+    recovered_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    outstanding_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    written_off_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    risk_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class SafetyAudit(Base):
     __tablename__ = "safety_audits"
 

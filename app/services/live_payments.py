@@ -65,6 +65,7 @@ class WebhookResult(PaymentStatus):
     idempotency_key: str
     duplicate: bool = False
     provider_refund_id: str | None = None
+    provider_dispute_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,10 +371,11 @@ class LivePaymentBridge:
             if event_type not in {
                 "payment.succeeded", "payment.failed", "payment.refunded",
                 "payment.pending", "payment.closed",
+                "payment.charged_back",
             }:
                 raise PaymentBridgeError("支付事件类型无效", code="invalid_webhook_type")
             status = event.get("status")
-            if status not in _STATUSES:
+            if status not in _STATUSES | {"charged_back"}:
                 raise PaymentBridgeError("支付状态无效", code="invalid_status")
             provider_refund_id: str | None = None
             if event_type == "payment.refunded":
@@ -383,6 +385,15 @@ class LivePaymentBridge:
                     raise PaymentBridgeError("支付退款号格式无效", code="invalid_provider_refund") from exc
             elif event.get("provider_refund_id") is not None:
                 raise PaymentBridgeError("非退款事件不得携带退款号", code="invalid_provider_refund")
+            provider_dispute_id: str | None = None
+            if event_type == "payment.charged_back":
+                if event.get("merchant_id") != self.merchant_id:
+                    raise PaymentBridgeError("拒付事件商户不匹配", code="invalid_merchant")
+                if status != "charged_back":
+                    raise PaymentBridgeError("拒付事件状态无效", code="invalid_status")
+                provider_dispute_id = self._validate_txn(event.get("provider_dispute_id", ""))
+            elif event.get("provider_dispute_id") is not None or status == "charged_back":
+                raise PaymentBridgeError("非拒付事件不得携带争议标识或状态", code="invalid_provider_dispute")
             old = self._seen_events.get(event_id)
             if old is not None and old != (digest, nonce):
                 raise PaymentBridgeError("同一事件编号的回调正文不一致", code="webhook_replay_conflict")
@@ -397,5 +408,5 @@ class LivePaymentBridge:
                 self._seen_events.pop(next(iter(self._seen_events)))
         return WebhookResult(
             order_id, amount, currency, status, txn, event_id, event_type, nonce,
-            f"payment:{event_id}", duplicate or old is not None, provider_refund_id,
+            f"payment:{event_id}", duplicate or old is not None, provider_refund_id, provider_dispute_id,
         )

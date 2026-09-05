@@ -57,6 +57,8 @@ Key 创建支持可选模型范围、单次输出上限和累计消费上限；�
 
 新增默认只预览的[告警邮件摘要 worker](docs/ALERT-NOTIFICATION-ACCEPTANCE.md)，复用持久化 outbox 与 SMTP，限制重复发送并保留未知结果。真实收件人/调度尚未启用，SMTP accepted 不等于收件箱送达。
 
+商业财务链路新增[独立拒付记录、冲正与风险处置 API](docs/CHARGEBACK-ACCEPTANCE.md)，schema head 为 `0016_chargebacks`。部分/重叠事件保留待对账；正式支付 SDK、返还处理与拒付专用 UI 仍未完成。
+
 ## OpenCode / OpenAI-compatible 接入
 
 自有工具可从[可运行 Python 接入样例](docs/OWN-TOOL-INTEGRATION.md)开始：默认预览，显式执行才调用模型；覆盖非流式、SSE、工具字段透传和原任务查询。仅为隔离模拟验收样例，不代表真实客户接入。

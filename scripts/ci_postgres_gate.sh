@@ -193,3 +193,4 @@ fi
 
 echo "PostgreSQL 16 isolated role/Vault/ACL gate passed (fake Vault fixture only)."
 "$python_bin" scripts/verify_managed_postgres.py
+"$python_bin" scripts/verify_chargebacks_postgres.py
