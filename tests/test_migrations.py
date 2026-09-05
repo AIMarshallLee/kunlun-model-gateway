@@ -182,6 +182,59 @@ def test_runtime_function_contract_is_chained_and_revokes_public_execute():
     assert "current_user <> 'kunlun_migrator'" in source
 
 
+def test_byok_credentials_migration_is_chained_and_keeps_secrets_external():
+    source = (ROOT / "alembic" / "versions" / "0011_byok_credentials.py").read_text()
+    assert 'revision: str = "0011_byok_credentials"' in source
+    assert 'down_revision: Union[str, None] = "0010_runtime_contract"' in source
+    assert "provider_connections" in source and "credential_action_audits" in source
+    assert "vault_ref" not in source
+    for trigger in (
+        "credential_action_audits_no_update",
+        "credential_action_audits_no_delete",
+        "credential_action_audits_no_truncate",
+    ):
+        assert trigger in source
+    assert "REVOKE INSERT, UPDATE, DELETE, TRUNCATE" in source
+    assert "CREATE POLICY kunlun_runtime_select_provider_connections" in source
+    assert "CREATE POLICY kunlun_runtime_select_credential_action_audits" in source
+
+
+def test_byok_budget_reconciliation_migration_only_allows_overrun_without_reservation():
+    source = (ROOT / "alembic" / "versions" / "0013_byok_budget_reconciliation.py").read_text()
+    assert 'revision: str = "0013_byok_budget_reconciliation"' in source
+    assert 'down_revision: Union[str, None] = "0012_supabase_vault"' in source
+    assert "kind = 'provider_spend_cap' AND spent_microusd > limit_microusd" in source
+    assert "batch_alter_table" in source
+    assert "drop_constraint" in source
+    assert "HAVING count(*) > 1" in source
+    assert "uq_active_budget_user_kind_period" in source
+
+
+def test_supabase_vault_migration_exposes_installation_marker_only_through_a_scoped_function():
+    source = (ROOT / "alembic" / "versions" / "0012_supabase_vault.py").read_text()
+    assert 'revision: str = "0012_supabase_vault"' in source
+    assert "CREATE TABLE kunlun_private.installation_marker" in source
+    assert "installation_id uuid NOT NULL DEFAULT gen_random_uuid()" in source
+    assert "CREATE OR REPLACE FUNCTION public.kunlun_installation_id()" in source
+    assert "SECURITY DEFINER SET search_path = pg_catalog" in source
+    assert "session_user NOT IN ('kunlun_runtime', 'kunlun_migrator', 'kunlun_vault_executor')" in source
+    assert "REVOKE ALL ON ALL TABLES IN SCHEMA kunlun_private FROM PUBLIC, anon, authenticated, kunlun_runtime, kunlun_vault_executor" in source
+    assert "REVOKE ALL ON FUNCTION public.kunlun_installation_id() FROM PUBLIC, anon, authenticated" in source
+    assert "GRANT EXECUTE ON FUNCTION public.kunlun_installation_id()" in source
+
+
+def test_role_bootstrap_creates_and_repairs_non_inheriting_least_privilege_roles():
+    source = (ROOT / "scripts" / "init-postgres-roles.sh").read_text()
+    for role in ("kunlun_runtime", "kunlun_migrator", "kunlun_vault_executor"):
+        assert f"CREATE ROLE {role} LOGIN NOINHERIT NOSUPERUSER" in source
+        assert f"ALTER ROLE {role} NOINHERIT NOSUPERUSER" in source
+    assert source.count("NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS") >= 6
+    assert "Kunlun database roles must not have membership edges in either direction" in source
+    assert "role.rolname IN ('kunlun_runtime', 'kunlun_migrator', 'kunlun_vault_executor')" in source
+    assert "pg_auth_members" in source
+    assert "数据库角色密码必须两两不同" in source
+
+
 def test_all_revision_identifiers_fit_alembic_version_column():
     import ast
 
@@ -222,7 +275,7 @@ def test_upgrade_from_initial_to_production_hardening_on_sqlite(tmp_path):
     command.upgrade(cfg, "head")
     engine = create_engine(db_url)
     tables = set(inspect(engine).get_table_names())
-    assert {"payment_refunds", "safety_audits"}.issubset(tables)
+    assert {"payment_refunds", "safety_audits", "provider_connections", "credential_action_audits"}.issubset(tables)
     refund_columns = {item["name"] for item in inspect(engine).get_columns("payment_refunds")}
     assert "claim_started_at" in refund_columns
     payment_columns = {item["name"] for item in inspect(engine).get_columns("payment_orders")}
@@ -232,6 +285,8 @@ def test_upgrade_from_initial_to_production_hardening_on_sqlite(tmp_path):
     assert {"payment_amount_minor", "checkout_url", "quote_numerator", "client_idempotency_key", "risk_reason"}.issubset(payment_columns)
     assert "checkout_claim_started_at" in payment_columns
     assert "reconciliation_claim_started_at" in payment_columns
+    assert "kind" in {item["name"] for item in inspect(engine).get_columns("budgets")}
+    assert "billing_mode" in {item["name"] for item in inspect(engine).get_columns("model_requests")}
     webhook_columns = {item["name"] for item in inspect(engine).get_columns("payment_webhook_events")}
     assert "nonce" in webhook_columns
     operator_columns = {item["name"] for item in inspect(engine).get_columns("operator_actions")}

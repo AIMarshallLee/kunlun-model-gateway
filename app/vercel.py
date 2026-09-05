@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hmac import compare_digest
 from ipaddress import ip_address
 from urllib.parse import unquote
 
@@ -10,6 +11,7 @@ from starlette.responses import PlainTextResponse
 
 CLIENT_IP_HEADER = b"x-kunlun-client-ip"
 PROXY_SECRET_HEADER = b"x-kunlun-proxy-secret"
+OPS_INGRESS_SECRET_HEADER = b"x-kunlun-ops-ingress-secret"
 # Vercel explicitly documents that it overwrites this value at ingress to
 # prevent caller spoofing. Do not prefer a generic application-supplied header.
 VERCEL_CLIENT_IP_HEADER = b"x-forwarded-for"
@@ -24,6 +26,7 @@ REMOVED_PROXY_HEADERS = {
     b"x-vercel-forwarded-for",
     CLIENT_IP_HEADER,
     PROXY_SECRET_HEADER,
+    OPS_INGRESS_SECRET_HEADER,
 }
 
 
@@ -62,7 +65,17 @@ def public_route_allowed(raw_path: bytes | str) -> bool:
         return False
     if path == "/metrics" or path.startswith("/metrics/"):
         return False
-    return path != "/ops" and not path.startswith("/ops/")
+    return True
+
+
+def _is_ops_path(raw_path: bytes | str) -> bool:
+    path = _canonical_path(raw_path)
+    return path == "/ops" or bool(path and path.startswith("/ops/"))
+
+
+def _single_header_value(headers: list[tuple[bytes, bytes]], name: bytes) -> bytes | None:
+    values = [value for header_name, value in headers if header_name.lower() == name]
+    return values[0] if len(values) == 1 else None
 
 
 def _single_ip(values: list[bytes]) -> bytes | None:
@@ -87,9 +100,10 @@ class VercelIngressMiddleware:
     resulting client IP to ``TrustedProxyClientIPMiddleware``.
     """
 
-    def __init__(self, app, *, proxy_secret: str) -> None:
+    def __init__(self, app, *, proxy_secret: str, ops_ingress_secret: str) -> None:
         self.app = app
         self.proxy_secret = proxy_secret.encode("ascii")
+        self.ops_ingress_secret = ops_ingress_secret.encode("ascii")
 
     async def __call__(self, scope, receive, send) -> None:
         if scope.get("type") != "http":
@@ -106,6 +120,18 @@ class VercelIngressMiddleware:
             return
 
         headers = list(scope.get("headers", ()))
+        if _is_ops_path(raw_path):
+            provided_ops_secret = _single_header_value(headers, OPS_INGRESS_SECRET_HEADER)
+            if provided_ops_secret is None or not compare_digest(
+                provided_ops_secret, self.ops_ingress_secret
+            ):
+                response = PlainTextResponse(
+                    "Not Found",
+                    status_code=404,
+                    headers={"Cache-Control": "no-store"},
+                )
+                await response(scope, receive, send)
+                return
         client_ip = _single_ip([
             value for name, value in headers
             if name.lower() == VERCEL_CLIENT_IP_HEADER

@@ -8,6 +8,8 @@ const state = {
   captchaTokens: { register: "", forgot: "", resend: "" },
   captchaWidgets: { register: null, forgot: null, resend: null },
   turnstilePromise: null,
+  testKey: "",
+  testIdempotency: "",
 };
 const byId = (id) => document.getElementById(id);
 
@@ -151,10 +153,21 @@ function cell(text, className = "") {
 
 async function loadReady() {
   state.ready = await api("/readyz", { auth: false });
+  const byok = state.ready.gateway_mode === "byok";
+  byId("register-form").hidden = !state.ready.public_signup;
+  byId("invitation-note").hidden = state.ready.public_signup;
+  byId("provider-panel").hidden = !byok;
+  byId("model-test-panel").hidden = !byok;
+  document.querySelector(".panel-wallet").hidden = byok;
+  document.querySelector(".panel-ledger").hidden = byok;
+  if (byok) {
+    byId("balance-label").textContent = "供应商累计支出";
+    byId("balance-note").textContent = "按本页最近调用记录汇总；以供应商账单为准";
+  }
   const flags = [
     state.ready.public_signup ? "注册开启" : "注册关闭",
     state.ready.live_payments ? "正式支付" : (state.ready.test_payments ? "测试支付" : "支付关闭"),
-    state.ready.live_upstream ? "真实上游" : "上游关闭",
+    byok ? "客户自带模型账号" : (state.ready.live_upstream ? "真实上游" : "上游关闭"),
   ];
   byId("environment-strip").textContent = flags.join(" / ");
   byId("signup-state").textContent = state.ready.public_signup ? "当前已开启" : "当前未开放";
@@ -170,7 +183,7 @@ async function loadReady() {
     await loadTurnstile();
     renderCaptcha("register");
   }
-  byId("mode-value").textContent = state.ready.live_payments ? "正式桥接" : (state.ready.test_payments ? "受控测试" : "安全关闭");
+  byId("mode-value").textContent = byok ? "BYOK" : (state.ready.live_payments ? "正式桥接" : (state.ready.test_payments ? "受控测试" : "安全关闭"));
   byId("provider-value").textContent = `${state.ready.providers} 个可用 Provider`;
   if (state.ready.live_payments) {
     const data = await api("/billing/packages", { auth: false });
@@ -239,7 +252,9 @@ async function loadTopups() {
 async function loadBudgets() {
   const data = await api("/budgets");
   const target = byId("budget-list");
-  const active = data.budgets.find((item) => item.status === "active");
+  const expectedKind = state.ready?.gateway_mode === "byok" ? "provider_spend_cap" : "prepaid_credit";
+  const active = data.budgets.find((item) => item.status === "active" && item.kind === expectedKind && new Date(item.period_end) > new Date());
+  if (state.ready?.gateway_mode === "byok") byId("reserved-value").textContent = amount(active?.reserved);
   byId("budget-value").textContent = active ? amount(active.available) : "未设置";
   if (!data.budgets.length) return empty(target, "尚未设置月度预算。");
   target.replaceChildren(...data.budgets.map((item) => record(
@@ -250,6 +265,7 @@ async function loadBudgets() {
 
 async function loadUsage() {
   const data = await api("/billing/usage");
+  if (state.ready?.gateway_mode === "byok") byId("balance-value").textContent = amount(data.entries.reduce((total, item) => total + item.upstream_cost, 0));
   const body = byId("usage-table");
   if (!data.entries.length) {
     const row = document.createElement("tr");
@@ -264,16 +280,111 @@ async function loadUsage() {
       cell(item.request_id.slice(0, 8)),
       cell(item.status, item.status.includes("pending") || item.status.includes("failed") ? "danger" : ""),
       cell(`${item.model} / ${item.provider || "—"}`),
-      cell(`${amount(item.amount)}${item.usage_estimated ? "（估算）" : ""}`),
+      cell(`${amount(state.ready?.gateway_mode === "byok" ? item.upstream_cost : item.amount)}${item.usage_estimated ? "（待对账）" : ""}`),
       cell(`${item.input_tokens} in / ${item.output_tokens} out`),
     );
+    const detail = document.createElement("button");
+    detail.type = "button";
+    detail.textContent = "查看处理记录";
+    detail.addEventListener("click", async () => {
+      try {
+        const status = await api(`/requests/${encodeURIComponent(item.request_id)}`);
+        byId("request-detail").textContent = describeRequest(status);
+      } catch (error) { showToast(error.message); }
+    });
+    row.firstChild.append(detail);
     return row;
   }));
 }
 
 async function refreshConsole() {
-  await Promise.all([loadKeys(), loadBalanceAndLedger(), loadTopups(), loadBudgets(), loadUsage()]);
+  const tasks = [loadKeys(), loadBudgets(), loadUsage()];
+  if (state.ready?.gateway_mode === "byok") tasks.push(loadConnections());
+  else tasks.push(loadBalanceAndLedger(), loadTopups());
+  await Promise.all(tasks);
 }
+
+function describeRequest(item) {
+  const guidance = {
+    wait_for_completion: "任务仍在处理，请稍后查询；不要重新提交。",
+    contact_operator_for_reconciliation: "费用待确认，请把任务编号交给运维人员核对。",
+    check_client_output_before_explicit_new_task: "任务已结算，请先检查客户端是否已保存结果。网关不保留回答；再次生成会成为新任务并可能另行计费。",
+    review_failure_before_explicit_new_task: "请先排查失败原因，确认后再新建任务。",
+  };
+  return `任务：${item.request_id}\n状态：${item.status}\n费用状态：${item.cost_state}\n供应商成本：${amount(item.upstream_cost_microusd)}\n${guidance[item.next_action] || "请联系运维确认。"}\n` +
+    (item.attempts || []).map((a) => `尝试 ${a.ordinal}：${a.provider} / ${a.status} / ${a.billing_status}${a.failure_category ? " / " + a.failure_category : ""}`).join("\n");
+}
+
+async function loadConnections() {
+  const [connections, catalog] = await Promise.all([api("/v1/provider-connections"), api("/v1/provider-catalog")]);
+  byId("provider-value").textContent = `${connections.data.filter((item) => item.status === "active").length} 个已连接 Provider（调用权限需测试）`;
+  byId("provider-select").replaceChildren(...catalog.data.map((item) => {
+    const option = document.createElement("option"); option.value = item.provider; option.textContent = item.provider; return option;
+  }));
+  byId("test-model-select").replaceChildren(...[...new Set(catalog.data.flatMap((item) => item.models))].map((model) => {
+    const option = document.createElement("option"); option.value = model; option.textContent = model; return option;
+  }));
+  const target = byId("connection-list");
+  if (!connections.data.length) return empty(target, "还未连接模型账号。");
+  target.replaceChildren(...connections.data.map((item) => record(
+    `${item.provider} · ${item.status}`, `密钥版本 ${item.credential_version}`,
+    ["active", "revoked_pending_destroy"].includes(item.status) ? "断开 / 清理连接" : "",
+    async () => {
+      if (!window.confirm("确认断开此模型连接？后续任务将无法使用它。")) return;
+      try {
+        const result = await api(`/v1/provider-connections/${encodeURIComponent(item.provider)}`, { method: "DELETE" });
+        showToast(result?.status === "revoked_pending_destroy" ? "连接已停用，密钥清理待重试" : "连接已断开");
+        await loadConnections();
+      } catch (error) { showToast(error.message); }
+    },
+  )));
+}
+
+byId("provider-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const data = formData(form);
+  form.elements.secret.value = "";
+  try {
+    await api(`/v1/provider-connections/${encodeURIComponent(data.provider)}`, {method: "PUT", body: {secret: data.secret}});
+    showToast("连接已保存。请设置预算，再运行首次调用验收。");
+    await loadConnections();
+  } catch (error) { showToast(error.message); }
+  finally { data.secret = ""; }
+});
+
+byId("model-test-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (state.testIdempotency && !window.confirm("这将创建另一项可能计费的新测试，不会恢复上次回答。确认已核对上次任务状态并继续？")) return;
+  const form = event.currentTarget;
+  const data = formData(form);
+  const button = form.querySelector("button");
+  state.testKey = data.gateway_key;
+  form.elements.gateway_key.value = "";
+  state.testIdempotency = window.crypto.randomUUID();
+  button.disabled = true;
+  byId("lookup-test").hidden = false;
+  try {
+    const result = await api("/v1/chat/completions", {auth: false, method: "POST",
+      headers: {Authorization: `Bearer ${state.testKey}`, "Idempotency-Key": state.testIdempotency},
+      body: {model: data.model, messages: [{role: "user", content: "Reply with OK"}], max_tokens: 16},
+    });
+    byId("model-test-result").textContent = `已收到模型响应：${result.choices?.[0]?.message?.content || "（无文本）"}`;
+    await Promise.all([loadUsage(), loadBudgets()]);
+  } catch (error) {
+    byId("model-test-result").textContent = `${error.message}\n请先查询本次任务状态；不要自动重新生成。`;
+  } finally { data.gateway_key = ""; button.disabled = false; }
+});
+
+byId("lookup-test").addEventListener("click", async () => {
+  try {
+    const status = await api("/v1/requests/lookup", {auth: false, method: "POST",
+      headers: {Authorization: `Bearer ${state.testKey}`, "Idempotency-Key": state.testIdempotency},
+    });
+    byId("model-test-result").textContent = describeRequest(status);
+  } catch (error) { showToast(error.message); }
+});
+byId("refresh-usage").addEventListener("click", () => Promise.all([loadUsage(), loadBudgets()]).catch((e) => showToast(e.message)));
 
 function enterConsole(token) {
   state.token = token;
@@ -289,6 +400,13 @@ async function logout() {
     // Local logout still clears the memory-only token if the session expired.
   } finally {
     state.token = "";
+    state.testKey = "";
+    state.testIdempotency = "";
+    byId("model-test-result").textContent = "";
+    byId("request-detail").textContent = "";
+    byId("lookup-test").hidden = true;
+    byId("provider-form").reset();
+    byId("model-test-form").reset();
     byId("secret-value").textContent = "";
     byId("one-time-secret").hidden = true;
     byId("console").hidden = true;
@@ -299,14 +417,15 @@ async function logout() {
 
 byId("register-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const data = formData(event.currentTarget);
+  const form = event.currentTarget;
+  const data = formData(form);
   if (state.ready && state.ready.captcha_required) {
     if (!state.captchaTokens.register) return showToast("请先完成人机验证");
     data.captcha_token = state.captchaTokens.register;
   }
   try {
     const result = await api("/auth/register", { method: "POST", body: data, auth: false });
-    event.currentTarget.reset();
+    form.reset();
     showToast(result.accepted ? "如该邮箱可注册或仍待验证，系统会发送验证邮件" : "账户已创建，请使用左侧表单登录");
   } catch (error) { showToast(error.message); }
   finally { if (state.ready && state.ready.captcha_required) resetCaptcha("register"); }
@@ -314,21 +433,23 @@ byId("register-form").addEventListener("submit", async (event) => {
 
 byId("login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const data = formData(event.currentTarget);
+  const form = event.currentTarget;
+  const data = formData(form);
   try {
     const result = await api("/auth/login", { method: "POST", body: data, auth: false });
-    event.currentTarget.reset();
+    form.reset();
     enterConsole(result.access_token);
   } catch (error) { showToast(error.message); }
 });
 
 byId("key-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  const form = event.currentTarget;
   try {
-    const result = await api("/v1/keys", { method: "POST", body: formData(event.currentTarget) });
+    const result = await api("/v1/keys", { method: "POST", body: formData(form) });
     byId("secret-value").textContent = result.key;
     byId("one-time-secret").hidden = false;
-    event.currentTarget.reset();
+    form.reset();
     await loadKeys();
   } catch (error) { showToast(error.message); }
 });
@@ -363,6 +484,7 @@ byId("checkout-form").addEventListener("submit", async (event) => {
 });
 
 byId("forgot-toggle").addEventListener("click", () => {
+  if (state.ready?.gateway_mode === "byok") return showToast("请联系交付负责人，核验身份后签发一次性恢复链接。");
   byId("forgot-fields").hidden = !byId("forgot-fields").hidden;
   if (!byId("forgot-fields").hidden && state.ready && state.ready.captcha_required) renderCaptcha("forgot");
 });
@@ -412,6 +534,7 @@ byId("reset-form").addEventListener("submit", async (event) => {
       body: { token, ...formData(event.currentTarget) },
       auth: false,
     });
+    byId("reset-form").reset();
     window.history.replaceState({}, "", "/");
     state.identityToken = "";
     byId("recovery-shell").hidden = true;
@@ -424,7 +547,8 @@ byId("budget-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const data = formData(event.currentTarget);
   try {
-    await api("/budgets", { method: "POST", body: { amount: Number(data.amount) } });
+    await api("/budgets", { method: "POST", body: { amount: Number(data.amount),
+      kind: state.ready?.gateway_mode === "byok" ? "provider_spend_cap" : "prepaid_credit" } });
     showToast("新月度预算已生效；旧预算保留为历史记录");
     await loadBudgets();
   } catch (error) { showToast(error.message); }

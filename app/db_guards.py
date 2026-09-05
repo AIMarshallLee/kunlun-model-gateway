@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import Engine, text
 
 
-SCHEMA_HEAD = "0010_runtime_contract"
+SCHEMA_HEAD = "0013_byok_budget_reconciliation"
 
 # Every application-owned table in the public schema.  Keep this allow-list
 # explicit: a Supabase deployment may contain unrelated extension tables that
@@ -31,9 +31,13 @@ KUNLUN_BUSINESS_TABLES = (
     "model_prices",
     "auth_rate_limit_counters",
     "outbox_events",
+    "provider_connections",
+    "credential_action_audits",
 )
 
-IMMUTABLE_APPEND_TABLES = ("ledger_transactions", "ledger_entries", "operator_actions")
+IMMUTABLE_APPEND_TABLES = (
+    "ledger_transactions", "ledger_entries", "operator_actions", "credential_action_audits",
+)
 
 LEDGER_TRIGGER_NAMES = (
     "ledger_transactions_no_update",

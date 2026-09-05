@@ -143,6 +143,7 @@ def test_authenticated_proxy_value_reaches_application(tmp_path, monkeypatch):
 def test_production_can_use_persisted_proxy_secret_instead_of_fixed_cidr(monkeypatch):
     ca_path = Path(__file__).resolve().parents[1] / "certs" / "supabase-prod-ca-2021.crt"
     monkeypatch.setenv("KUNLUN_ENV", "production")
+    monkeypatch.setenv("KUNLUN_GATEWAY_MODE", "disabled")
     monkeypatch.setenv(
         "KUNLUN_DATABASE_URL",
         "postgresql+psycopg://runtime:secret@db.example/gateway"

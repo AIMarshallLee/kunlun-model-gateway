@@ -16,6 +16,7 @@ ALLOWED_SCOPES = {
     "reconciliation:write",
     "accounts:read",
     "accounts:write",
+    "accounts:invite",
     "payments:read",
     "payments:write",
     "payments:risk:write",

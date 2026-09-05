@@ -9,6 +9,40 @@ permissions:
   contents: read
 
 jobs:
+  postgres-contract:
+    name: PostgreSQL 16 role and Vault contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_DB: kunlun_ci
+          POSTGRES_PASSWORD: ci-admin-inert-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kunlun_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGPASSWORD: ci-admin-inert-password
+      POSTGRES_USER: postgres
+      POSTGRES_DB: kunlun_ci
+      KUNLUN_RUNTIME_DB_PASSWORD: ci-runtime-inert-password
+      KUNLUN_MIGRATOR_DB_PASSWORD: ci-migrator-inert-password
+      KUNLUN_VAULT_EXECUTOR_DB_PASSWORD: ci-executor-inert-password
+      KUNLUN_CI_ISOLATED_DATABASE: kunlun-ci-disposable
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.8.17"
+      - run: uv sync --locked --extra postgres --extra test --python 3.12
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Migrate and verify real PostgreSQL permissions with a fake Vault catalog
+        run: bash scripts/ci_postgres_gate.sh
+
   python:
     name: Python 3.12 tests and coverage
     runs-on: ubuntu-latest

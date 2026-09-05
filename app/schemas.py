@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .security import normalize_email
 
@@ -103,6 +103,20 @@ class AccountStatusRequest(StrictModel):
 
 class BudgetAmountRequest(StrictModel):
     amount: int = Field(gt=0, le=10_000_000_000)
+    kind: Literal["prepaid_credit", "provider_spend_cap"] = "prepaid_credit"
+
+
+class ProviderConnectionPutRequest(StrictModel):
+    secret: SecretStr = Field(min_length=8, max_length=4096)
+    label: str | None = Field(default=None, max_length=120)
+
+    @field_validator("secret")
+    @classmethod
+    def secret_has_no_controls(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        if any(ord(char) < 33 or ord(char) == 127 for char in raw):
+            raise ValueError("密钥不能含控制字符或空白")
+        return value
 
 
 class ChatMessage(StrictModel):

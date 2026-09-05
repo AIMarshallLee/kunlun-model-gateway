@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -185,11 +185,29 @@ class Budget(Base):
         CheckConstraint("limit_microusd > 0", name="budget_limit_positive"),
         CheckConstraint("reserved_microusd >= 0", name="budget_reserved_nonnegative"),
         CheckConstraint("spent_microusd >= 0", name="budget_spent_nonnegative"),
-        CheckConstraint("spent_microusd + reserved_microusd <= limit_microusd", name="budget_within_limit"),
+        # An audited reconciliation may record a verified upstream cost after
+        # the automatic cap was exhausted. It may never coexist with a live
+        # reservation, so normal new requests remain fail-closed.
+        CheckConstraint(
+            "spent_microusd + reserved_microusd <= limit_microusd OR "
+            "(kind = 'provider_spend_cap' AND spent_microusd > limit_microusd "
+            "AND reserved_microusd = 0)",
+            name="budget_within_limit",
+        ),
+        Index(
+            "uq_active_budget_user_kind_period",
+            "user_id",
+            "kind",
+            "period_start",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(32), default="prepaid_credit", index=True)
     limit_microusd: Mapped[int] = mapped_column(BigInteger)
     reserved_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
     spent_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -236,6 +254,7 @@ class ModelRequest(Base):
     final_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
     final_provider: Mapped[str | None] = mapped_column(String(80), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="reserved", index=True)
+    billing_mode: Mapped[str] = mapped_column(String(24), default="prepaid", index=True)
     price_version: Mapped[int] = mapped_column(Integer)
     input_price: Mapped[int] = mapped_column(BigInteger)
     output_price: Mapped[int] = mapped_column(BigInteger)
@@ -247,6 +266,8 @@ class ModelRequest(Base):
     usage_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
     fallback_count: Mapped[int] = mapped_column(Integer, default=0)
     failure_category: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    final_attempt_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    cost_state: Mapped[str] = mapped_column(String(32), default="reserved", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -263,8 +284,46 @@ class ProviderAttempt(Base):
     status: Mapped[str] = mapped_column(String(32))
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     failure_category: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    credential_connection_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    credential_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pricing_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    input_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    output_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    upstream_cost_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    usage_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
+    billing_status: Mapped[str] = mapped_column(String(32), default="unsettled", index=True)
+    is_final: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class ProviderConnection(Base):
+    """Tenant-owned safe provider metadata; secret bindings live privately."""
+
+    __tablename__ = "provider_connections"
+    __table_args__ = (UniqueConstraint("user_id", "provider", name="uq_provider_connection_user_provider"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(80), index=True)
+    label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True)
+    credential_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CredentialActionAudit(Base):
+    __tablename__ = "credential_action_audits"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    connection_id: Mapped[str] = mapped_column(ForeignKey("provider_connections.id", ondelete="RESTRICT"), index=True)
+    action: Mapped[str] = mapped_column(String(32), index=True)
+    credential_version: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class RateLimitCounter(Base):

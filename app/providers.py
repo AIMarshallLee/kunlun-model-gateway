@@ -11,10 +11,10 @@ from urllib.parse import urlparse
 import httpx
 
 from gateway import ProviderError
+from app.config import BYOK_PROVIDER_CATALOG, validate_byok_provider_endpoint
 
 
 ProviderCallable = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
-
 
 @dataclass(slots=True)
 class ProviderStream:
@@ -34,7 +34,7 @@ class ProviderStream:
 class OpenAICompatibleProvider:
     provider_name: str
     base_url: str
-    api_key: str
+    api_key: str = field(repr=False)
     models: set[str] = field(default_factory=set)
     pricing: dict[str, dict[str, int]] = field(default_factory=dict)
     connect_timeout_seconds: float = 5.0
@@ -253,6 +253,49 @@ def build_provider_clients(
             read_timeout_seconds=read_timeout,
         ))
     return clients
+
+
+def build_byok_provider_client(
+    config: dict[str, Any],
+    *,
+    api_key: str,
+    allowed_hosts: set[str],
+) -> OpenAICompatibleProvider:
+    """Build one short-lived BYOK client from a server-owned definition.
+
+    No client URL, model list or credential source is accepted from a request.
+    """
+    if not isinstance(config, dict):
+        raise RuntimeError("BYOK Provider 配置必须是对象")
+    name = str(config.get("name") or "").strip().casefold()
+    base_url = str(config.get("base_url") or "").strip()
+    models = config.get("models") or []
+    parsed = urlparse(base_url)
+    try:
+        validate_byok_provider_endpoint(name, base_url)
+    except RuntimeError as exc:
+        raise RuntimeError("BYOK Provider 目录无效") from exc
+    if (
+        name not in BYOK_PROVIDER_CATALOG
+        or not base_url
+        or parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.hostname.casefold() not in allowed_hosts
+        or parsed.username or parsed.password or parsed.query or parsed.fragment
+        or not isinstance(models, list)
+        or any(not isinstance(model, str) or not model or len(model) > 120 for model in models)
+    ):
+        raise RuntimeError("BYOK Provider 目录无效")
+    pricing = config.get("pricing") or {}
+    if not isinstance(pricing, dict):
+        raise RuntimeError("BYOK Provider 价格目录无效")
+    return OpenAICompatibleProvider(
+        provider_name=name,
+        base_url=base_url,
+        api_key=api_key,
+        models=set(models),
+        pricing=pricing,
+    )
 
 
 def provider_name(client: ProviderCallable, index: int) -> str:

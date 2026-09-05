@@ -66,6 +66,7 @@ def test_stale_reserved_model_request_moves_to_manual_queue_without_releasing_ho
         recovered = session.get(ModelRequest, reservation.request_id)
         assert changed == 1
         assert recovered.status == "pending_reconciliation"
+        assert recovered.cost_state == "pending_reconciliation"
         assert recovered.failure_category == "reservation_lease_expired"
         assert recovered.completed_at is not None
         wallet = session.get(Wallet, user.id)

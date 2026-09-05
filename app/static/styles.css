@@ -255,6 +255,7 @@ input:focus { border-bottom: 3px solid var(--signal); padding-bottom: 11px; }
 .empty { padding: 18px; color: var(--muted); background: var(--paper); }
 
 .table-wrap { overflow-x: auto; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 13px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
 th { color: var(--muted); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }

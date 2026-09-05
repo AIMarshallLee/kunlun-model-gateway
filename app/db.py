@@ -13,7 +13,15 @@ class Base(DeclarativeBase):
 
 def build_engine(database_url: str) -> Engine:
     connect_args = {"check_same_thread": False, "timeout": 30} if database_url.startswith("sqlite") else {}
-    engine = create_engine(database_url, future=True, pool_pre_ping=True, connect_args=connect_args)
+    # Provider secrets may be passed as bound SQL parameters; never echo them
+    # in SQLAlchemy engine logs or exception context.
+    engine = create_engine(
+        database_url,
+        future=True,
+        pool_pre_ping=True,
+        hide_parameters=True,
+        connect_args=connect_args,
+    )
     if database_url.startswith("sqlite"):
         @event.listens_for(engine, "connect")
         def _sqlite_pragmas(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
@@ -61,6 +69,14 @@ def install_ledger_guards(engine: Engine) -> None:
         """CREATE TRIGGER IF NOT EXISTS operator_actions_no_delete
         BEFORE DELETE ON operator_actions BEGIN
           SELECT RAISE(ABORT, 'operator_actions append-only');
+        END""",
+        """CREATE TRIGGER IF NOT EXISTS credential_action_audits_no_update
+        BEFORE UPDATE ON credential_action_audits BEGIN
+          SELECT RAISE(ABORT, 'credential_action_audits append-only');
+        END""",
+        """CREATE TRIGGER IF NOT EXISTS credential_action_audits_no_delete
+        BEFORE DELETE ON credential_action_audits BEGIN
+          SELECT RAISE(ABORT, 'credential_action_audits append-only');
         END""",
     )
     with engine.begin() as connection:
