@@ -44,6 +44,14 @@ if __name__ == "__main__":
         def payment_calls():
             return {"count": len(bridge.checkout_calls)}
 
+        @app.get("/__fixture__/latest-token")
+        def latest_token(email: str, kind: str):
+            # The fixture contains only in-memory emails for synthetic users.
+            # This route must never be copied into the application package.
+            matches = [message for message in app.state.identity_sender.messages
+                       if message.recipient == email and message.kind == kind]
+            return {"token": matches[-1].token if matches else None}
+
         try:
             uvicorn.run(app, host="127.0.0.1", port=8796, access_log=False, log_level="warning")
         finally:

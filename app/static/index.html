@@ -9,12 +9,14 @@
   <script src="/assets/app.js" type="module"></script>
 </head>
 <body>
+  <noscript><p class="boundary-note">JavaScript is required for this console. Do not enter credentials until scripts are available; native form submission is disabled.</p></noscript>
   <header class="masthead">
-    <a class="wordmark" href="/" aria-label="昆仑模型网关首页">
+    <a class="wordmark" href="/" aria-label="昆仑模型网关首页" data-console-link>
       <span class="seal">昆</span>
       <span>昆仑模型网关</span>
     </a>
     <div class="env-strip" id="environment-strip" aria-live="polite">读取运行状态…</div>
+    <button id="console-language" type="button" aria-label="语言" data-no-translate>中文</button>
   </header>
 
   <main>
@@ -218,6 +220,7 @@
   </main>
 
   <footer>
+    <nav id="console-guide-links"><a href="/api-guide" data-console-link>接入指南</a> · <a href="/service-info" data-console-link>服务与支持</a></nav>
     <span>Kunlun / 可审计模型调用</span>
     <span>测试通过 ≠ 公网、支付或合规验收</span>
   </footer>

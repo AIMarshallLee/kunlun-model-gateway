@@ -365,13 +365,13 @@ def create_app(
         content_security_policy = (
             "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; "
             "frame-src https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data:; "
-            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
         )
     else:
         content_security_policy = (
             "default-src 'self'; script-src 'self'; frame-src 'none'; style-src 'self'; "
             "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
-            "frame-ancestors 'none'; form-action 'self'"
+            "frame-ancestors 'none'; form-action 'none'"
         )
 
     @app.middleware("http")

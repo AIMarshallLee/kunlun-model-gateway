@@ -35,7 +35,7 @@ const fs = require("node:fs");
       }
       await route.fulfill({response});
     });
-    await page.goto("https://gateway.example/console");
+    await page.goto("https://gateway.example/console?lang=zh");
     await page.locator("#login-form [name=email]").fill("managed@example.com");
     await page.locator("#login-form [name=password]").fill("a sufficiently long password");
     await page.locator("#login-form button[type=submit]").click();
