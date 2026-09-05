@@ -43,9 +43,9 @@ if __name__ == "__main__":
 
         @app.get("/__fixture__/operator")
         def operator(profile: str = "read"):
-            scopes = {"console:read", "accounts:read", "payments:read", "reconciliation:read", "channels:read", "metrics:read", "audit:read"}
+            scopes = {"console:read", "accounts:read", "payments:read", "reconciliation:read", "models:read", "channels:read", "metrics:read", "audit:read"}
             if profile == "write":
-                scopes |= {"accounts:write", "payments:write", "reconciliation:write", "payments:risk:write"}
+                scopes |= {"accounts:write", "payments:write", "reconciliation:write", "payments:risk:write", "models:write"}
             return {"token": mint_operator_token(OPS, subject="synthetic-operator", scopes=scopes, ttl_seconds=300),
                     "requests": requests, "order_id": bridge.webhook.order_id}
 

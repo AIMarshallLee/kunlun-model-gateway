@@ -12,6 +12,8 @@ import time
 
 
 ALLOWED_SCOPES = {
+    "models:read",
+    "models:write",
     "console:read",
     "audit:read",
     "channels:read",

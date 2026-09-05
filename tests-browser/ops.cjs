@@ -8,7 +8,7 @@ const path = require("node:path");
   const browser = await chromium.launch({headless: true});
   const page = await browser.newPage({viewport: {width: 1365, height: 1000}});
   const errors = [], writes = [];
-  let loseRefund = false;
+  let loseRefund = false, losePrice = false;
   try {
     page.on("pageerror", (error) => errors.push(error.message));
     await page.route("**/*", async (route) => {
@@ -21,6 +21,9 @@ const path = require("node:path");
       }
       if (loseRefund && url.pathname.endsWith("/refund")) {
         loseRefund = false; await route.fetch(); await route.abort("failed"); return;
+      }
+      if (losePrice && url.pathname.endsWith("/price")) {
+        losePrice = false; await route.fetch(); await route.abort("failed"); return;
       }
       await route.continue();
     });
@@ -63,6 +66,11 @@ const path = require("node:path");
     await page.waitForFunction(() => document.querySelector("#snapshot").textContent !== "");
     assert.equal(await page.locator("#action-form").isVisible(), false);
     const account = JSON.parse(await page.locator("#snapshot").textContent()).account;
+    await module("Models & retail prices");
+    await page.locator("#records .record").first().click();
+    await page.waitForFunction(() => document.querySelector("#snapshot").textContent !== "");
+    const model = JSON.parse(await page.locator("#snapshot").textContent()).model;
+    assert.equal(await page.locator("#action-form").isVisible(), false);
     await page.locator("#logout").click();
     const info = await login("write");
     await inspect(account.id);
@@ -98,6 +106,32 @@ const path = require("node:path");
     await inspect(info.order_id);
     assert.equal(JSON.parse(await page.locator("#snapshot").textContent()).order.status, "refunded");
     assert.equal((await (await page.request.get("http://127.0.0.1:8797/__fixture__/refund-calls")).json()).count, 1);
+    await module("Models & retail prices"); await inspect(model.id);
+    await page.locator("#retail-input").fill("2000000");
+    await page.locator("#retail-output").fill("3000000");
+    await prepare("Publish a new price");
+    const pricePreview = await page.locator("#command-preview").innerText(), priceWrites = writes.length;
+    await page.locator("#language").click(); await page.locator("#language").click();
+    assert.equal(await page.locator("#retail-input").inputValue(), "2000000");
+    assert.equal(await page.locator("#command-preview").innerText(), pricePreview);
+    assert.equal(writes.length, priceWrites);
+    await page.locator("#price-fields").scrollIntoViewIfNeeded();
+    await page.screenshot({path: path.resolve("release-artifacts/ops-price-desktop.png")});
+    losePrice = true; await execute();
+    await page.waitForFunction(() => document.querySelector("#notice").textContent.includes("unknown"));
+    assert.equal(await page.locator("#command-preview").innerText(), pricePreview);
+    await inspect(model.id);
+    let prices = JSON.parse(await page.locator("#snapshot").textContent());
+    assert.equal(prices.model.version, 2);
+    assert.equal(prices.history.find((row) => row.version === 1).input_microusd_per_million, model.input_microusd_per_million);
+    await page.locator("#retail-input").fill("-1"); // irrelevant invalid draft must not block unlisting
+    await prepare("Unlist model"); await execute(); await inspect(model.id);
+    assert.equal(JSON.parse(await page.locator("#snapshot").textContent()).model.active, false);
+    assert.deepEqual((await (await page.request.get("http://127.0.0.1:8797/public/catalog")).json()).models, []);
+    await prepare("Publish a new price"); await execute(); await inspect(model.id);
+    prices = JSON.parse(await page.locator("#snapshot").textContent());
+    assert.equal(prices.model.version, 4);
+    assert.equal(prices.model.active, true);
     await module("Accounts & keys"); await inspect(account.id); await prepare("freeze account"); await execute();
     await inspect(account.id); await prepare("unfreeze account"); await execute(); await inspect(account.id);
     assert.equal(JSON.parse(await page.locator("#snapshot").textContent()).keys.find((row) => row.id === key.id).status, "revoked");
@@ -111,6 +145,6 @@ const path = require("node:path");
     assert.equal(await page.locator("#snapshot").textContent(), "");
     assert.equal(await page.evaluate(() => localStorage.length + sessionStorage.length), 0);
     assert.deepEqual(errors, []);
-    console.log("PASS: operator read/write scopes; review before write; bilingual immutable confirmation; key/account freeze; request release/settle; lost refund response -> one simulated refund; audit; logout; mobile layout.");
+    console.log("PASS: operator read/write scopes; review before write; bilingual immutable confirmation; key/account freeze; request release/settle; lost refund response -> one simulated refund; price versions/unlist/relist; audit; logout; mobile layout.");
   } finally { await browser.close(); }
 })().catch((error) => {console.error(error); process.exitCode = 1;});

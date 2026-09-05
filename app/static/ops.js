@@ -8,6 +8,7 @@ const modules = [
   {id: "accounts", scope: "accounts:read", en: "Accounts & keys", zh: "客户与 Key", path: "/ops/accounts", detail: "/ops/accounts/", field: "items"},
   {id: "orders", scope: "payments:read", en: "Orders & refunds", zh: "订单与退款", path: "/ops/orders", detail: "/ops/orders/", field: "items"},
   {id: "requests", scope: "reconciliation:read", en: "Model reconciliation", zh: "模型对账", path: "/ops/reconciliation", detail: "/ops/requests/", field: "requests"},
+  {id: "models", scope: "models:read", en: "Models & retail prices", zh: "模型与售价", path: "/ops/models", detail: "/ops/models/", field: "items"},
   {id: "channels", scope: "channels:read", en: "Supply status", zh: "渠道状态", path: "/ops/channels", field: "channels"},
   {id: "budget", scope: "metrics:read", en: "Platform budget", zh: "平台预算", path: "/ops/platform-budget"},
   {id: "audit", scope: "audit:read", en: "Audit trail", zh: "操作审计", path: "/ops/audit", field: "items"},
@@ -57,8 +58,15 @@ function renderChrome() {
 }
 function renderFacts() {
   if (!selected) return;
-  const {data, kind} = selected, row = data.account || data.order || data.request;
-  const facts = [[say("Object ID", "对象 ID"), row.id], [say("Status", "状态"), row.status]];
+  const {data, kind} = selected, row = data.account || data.order || data.request || data.model;
+  const facts = [[say("Object ID", "对象 ID"), row.id], [say("Status", "状态"), kind === "models" ? (row.active ? say("Listed", "已上架") : say("Unlisted", "已下架")) : row.status]];
+  if (kind === "models") facts.push(
+    [say("Model", "模型"), row.model], [say("Price version", "售价版本"), `v${row.version}`],
+    [say("Input / 1M tokens", "输入 / 百万 Token"), `${row.input_microusd_per_million} microUSD`],
+    [say("Output / 1M tokens", "输出 / 百万 Token"), `${row.output_microusd_per_million} microUSD`],
+    [say("Output token limit", "输出 Token 上限"), row.max_output_tokens],
+    [say("Effective at (UTC)", "生效时间（UTC）"), row.effective_at],
+  );
   if (kind === "accounts") facts.push(
     [say("Customer", "客户"), row.email], [say("Email verified", "邮箱已验证"), row.email_verified_at ? say("Yes", "是") : say("No", "否")],
     [say("Available credit", "可用额度"), `${data.wallet?.balance_microusd ?? "—"} microUSD`],
@@ -87,7 +95,7 @@ async function load() {
   byId("records").replaceChildren(); byId("lookup").hidden = !active.detail;
   byId("next").disabled = true; byId("previous").disabled = true; byId("page").textContent = "";
   try {
-    const paginated = ["accounts", "orders", "requests", "audit"].includes(active.id);
+    const paginated = ["accounts", "orders", "requests", "models", "audit"].includes(active.id);
     const data = await client.request(active.path + (paginated ? `?limit=20&offset=${offset}` : ""));
     if (current !== epoch) return;
     const rows = active.field ? data[active.field] : [data];
@@ -99,7 +107,7 @@ async function load() {
     byId("records").replaceChildren(...rows.map((row) => {
       const button = document.createElement("button"); button.className = "record"; button.type = "button";
       const title = document.createElement("strong"), summary = document.createElement("small");
-      title.textContent = row.email || row.id || row.request_id || row.provider || row.period || active[language];
+      title.textContent = row.email || row.model || row.id || row.request_id || row.provider || row.period || active[language];
       summary.textContent = [row.status, row.action, row.model, row.created_at].filter(Boolean).join(" · ");
       button.append(title, summary);
       button.addEventListener("click", () => active.detail ? inspect(row.id || row.request_id) : showJSON("snapshot", row));
@@ -114,12 +122,25 @@ async function inspect(id) {
     const data = await client.request(active.detail + encodeURIComponent(id));
     if (current !== epoch) return;
     selected = {id, kind: active.id, data}; showJSON("snapshot", data); renderFacts(); renderActions();
+    if (selected.kind === "models") {
+      byId("retail-input").value = data.model.input_microusd_per_million;
+      byId("retail-output").value = data.model.output_microusd_per_million;
+      byId("retail-max-output").value = data.model.max_output_tokens;
+    }
   } catch (error) { if (current === epoch) errorNotice(error); }
 }
 function buildActions() {
   if (!selected) return [];
   const {data, id, kind} = selected, list = [];
-  const add = (en, zh, path, body, target, state, settle = false) => list.push({en, zh, path, body, target, state, settle});
+  const add = (en, zh, path, body, target, state, settle = false, price = false) => list.push({en, zh, path, body, target, state, settle, price});
+  if (kind === "models" && has("models:write")) {
+    const row = data.model, path = `/ops/models/${encodeURIComponent(id)}/price`;
+    const state = `${row.active ? "listed" : "unlisted"}:v${row.version}`;
+    add("Publish a new price version", "发布新售价版本并上架", path,
+      {action: "publish", expected_version: row.version, operation_id: crypto.randomUUID()}, row.model, state, false, true);
+    if (row.active) add("Unlist model", "下架模型", path,
+      {action: "unpublish", expected_version: row.version, operation_id: crypto.randomUUID()}, row.model, state);
+  }
   if (kind === "accounts" && has("accounts:write")) {
     const account = data.account;
     if (["active", "frozen"].includes(account.status)) {
@@ -163,6 +184,9 @@ function renderActions() {
   if (actions[Number(previous)]) byId("action").value = previous;
   byId("action-form").hidden = !actions.length;
   byId("usage-fields").hidden = !actions[Number(byId("action").value)]?.settle;
+  byId("price-fields").hidden = !actions[Number(byId("action").value)]?.price;
+  // Hidden price fields must not block an unlist command via native validation.
+  byId("price-fields").querySelectorAll("input").forEach((element) => { element.disabled = executing || byId("price-fields").hidden; });
 }
 byId("operator-login").addEventListener("submit", async (event) => {
   event.preventDefault(); const raw = byId("operator-token").value.trim(); byId("operator-token").value = "";
@@ -182,9 +206,10 @@ byId("refresh").addEventListener("click", load);
 byId("previous").addEventListener("click", () => { offset = Math.max(0, offset - 20); load(); });
 byId("next").addEventListener("click", () => { offset += 20; load(); });
 byId("lookup").addEventListener("submit", (event) => { event.preventDefault(); inspect(byId("object-id").value.trim()); });
-byId("action").addEventListener("change", () => { cancelCommand(); byId("usage-fields").hidden = !actions[Number(byId("action").value)]?.settle; });
+byId("action").addEventListener("change", () => { cancelCommand(); renderActions(); });
 byId("reason").addEventListener("input", cancelCommand);
 byId("usage-fields").addEventListener("input", cancelCommand);
+byId("price-fields").addEventListener("input", cancelCommand);
 byId("action-form").addEventListener("submit", (event) => {
   event.preventDefault(); if (executing) return;
   const action = actions[Number(byId("action").value)]; if (!action) return;
@@ -193,6 +218,13 @@ byId("action-form").addEventListener("submit", (event) => {
     for (const [field, id] of [["input_tokens", "input-tokens"], ["output_tokens", "output-tokens"], ["upstream_cost_microusd", "upstream-cost"]]) {
       const raw = byId(id).value, value = Number(raw);
       if (!raw || !Number.isSafeInteger(value) || value < 0) { notice(say("Verified usage and cost must be nonnegative integers.", "核实后的用量和成本必须为非负整数。")); return; }
+      body[field] = value;
+    }
+  }
+  if (action.price) {
+    for (const [field, id] of [["input_microusd_per_million", "retail-input"], ["output_microusd_per_million", "retail-output"], ["max_output_tokens", "retail-max-output"]]) {
+      const raw = byId(id).value, value = Number(raw);
+      if (!raw || !Number.isSafeInteger(value) || value < 1) { notice(say("Retail prices and output limit must be positive integers.", "售价和输出上限必须为正整数。")); return; }
       body[field] = value;
     }
   }

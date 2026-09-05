@@ -119,10 +119,19 @@ def token_cost(tokens: int, price_per_million: int) -> int:
 
 
 def get_price(session: Session, model: str) -> ModelPrice | None:
+    # The oldest version is a stable per-model anchor. Admission holds a
+    # shared lock until its reservation commits; operator changes take the
+    # exclusive lock. No model lock is held during an upstream call.
+    anchor = session.scalar(select(ModelPrice.id).where(ModelPrice.model == model)
+                            .order_by(ModelPrice.version).limit(1).with_for_update(read=True))
+    if anchor is None:
+        return None
+    if session.get_bind().dialect.name == "sqlite":
+        session.execute(update(ModelPrice).where(ModelPrice.id == anchor).values(active=ModelPrice.active))
     return session.scalar(select(ModelPrice).where(
         ModelPrice.model == model,
         ModelPrice.active.is_(True),
-    ).order_by(ModelPrice.version.desc()))
+    ).order_by(ModelPrice.version.desc()).execution_options(populate_existing=True))
 
 
 def reserve_model_request(

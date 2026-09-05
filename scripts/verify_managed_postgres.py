@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import sys
+from threading import Barrier
 from uuid import uuid4
 
 from sqlalchemy import create_engine, func, select
@@ -12,9 +13,9 @@ from sqlalchemy.orm import Session
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.models import ApiKey, LedgerEntry, ModelPrice, ModelRequest, PlatformDailyBudget, User, Wallet
+from app.models import ApiKey, LedgerEntry, ModelPrice, ModelRequest, OperatorAction, PlatformDailyBudget, User, Wallet
 from app.security import utcnow
-from app.services.gateway_billing import BillingError, key_usage, reserve_model_request, release_model_request
+from app.services.gateway_billing import BillingError, key_usage, reserve_model_request, release_model_request, settle_model_request
 from app.services.ledger import CUSTOMER_AVAILABLE, PLATFORM_CLEARING, post_transaction
 
 
@@ -129,7 +130,56 @@ def main():
     for reservation in raced:
         with Session(engine) as db:
             release_model_request(db, reservation.request_id, "ci_frozen_key_existing_hold")
+    # Actual price commands under the restricted runtime role: competing
+    # operators cannot both publish over v1, and v1 holds settle at v1 prices.
+    from fastapi import HTTPException
+    from app.model_catalog import PriceChange, change_price
+    price_claims = OperatorClaims("ci-price-operator", frozenset({"models:write"}), 0, 1, "ci-inert-price-token")
+    request_context.app.state.settings = SimpleNamespace(
+        session_pepper="ci-inert-pepper", gateway_mode="managed_gateway", max_output_tokens=4096,
+        models={model: {}}, providers=[{"models": [model], "pricing": {model: {
+            "input_microusd_per_million": 500000, "output_microusd_per_million": 500000}}}])
+    with Session(engine) as db:
+        anchor_id = db.scalar(select(ModelPrice.id).where(ModelPrice.model == model))
+    old_hold = reserve(12001)  # non-frozen principal 1
+    assert old_hold is not None
+    start = Barrier(2)
+    def publish(i):
+        start.wait(timeout=10)
+        try:
+            change_price(anchor_id, PriceChange(action="publish", expected_version=1,
+                operation_id=f"{run}:price:{i}", reason="isolated concurrent price version acceptance",
+                input_microusd_per_million=2000000, output_microusd_per_million=3000000,
+                max_output_tokens=4096), request_context, price_claims)
+            return 201
+        except HTTPException as error:
+            return error.status_code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(publish, range(2))) == [201, 409]
+    with Session(engine) as db:
+        settle_model_request(db, request_id=old_hold.request_id, response={"usage": {"prompt_tokens": 4, "completion_tokens": 2}},
+                            provider="ci-synthetic", fallback_count=0, upstream_cost_override=3)
+        old_request = db.get(ModelRequest, old_hold.request_id)
+        assert old_request.price_version == 1 and old_request.charged_microusd == 6
+        assert db.scalar(select(func.count()).select_from(OperatorAction).where(
+            OperatorAction.target_id == anchor_id, OperatorAction.action == "model_publish")) == 1
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        pending = [pool.submit(reserve, 15001 + i * 3) for i in range(16)]
+        unlisted = pool.submit(change_price, anchor_id, PriceChange(action="unpublish", expected_version=2,
+            operation_id=f"{run}:unlist", reason="isolated unlisting versus new admissions acceptance"), request_context, price_claims)
+        price_raced = [result for future in pending if (result := future.result()) is not None]
+        assert unlisted.result()["model"]["active"] is False
+    assert reserve(18001) is None, "new admission crossed committed unlisting"
+    with Session(engine) as db:
+        for reservation in price_raced:
+            assert db.get(ModelRequest, reservation.request_id).price_version == 2
+            release_model_request(db, reservation.request_id, "ci_unlisted_existing_hold")
+        versions = db.scalars(select(ModelPrice).where(ModelPrice.model == model).order_by(ModelPrice.version)).all()
+        assert [row.version for row in versions] == [1, 2, 3]
+        assert not any(row.active for row in versions)
+        assert versions[0].input_microusd_per_million == 1000000
     engine.dispose()
+    print("Price PostgreSQL races passed: competing v1 commands -> 201/409; historical settlement unchanged; no new admission after unlisting.")
     print("Key freeze PostgreSQL race passed: no new admission after freeze; existing holds can finalize.")
     print("Key PostgreSQL concurrency passed: 16 distinct requests on one capped key -> 1 hold; release restored capacity.")
     print(f"Managed PostgreSQL concurrency passed: 3 tenants, 16 duplicate attempts -> 1 hold; 24 competing requests -> {len(admitted)} admitted; balanced ledgers and no negative wallets.")

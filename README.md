@@ -51,6 +51,8 @@ Key 创建支持可选模型范围、单次输出上限和累计消费上限；�
 
 独立运营台入口 `/ops/console`，使用短时分权限运维凭证，不接受客户 Key。可查询客户/订单/待对账/渠道/预算/审计，确认后执行已有运维流程。能力、权限、模拟验收及未完成项见 [运营台交付记录](docs/OPS-CONSOLE-ACCEPTANCE.md)。
 
+商业模式已有模型售价版本、上下架与历史查询；调价不重算旧请求，重启不覆盖运营目录。接口、权限、并发锁及回滚限制见 [模型售价验收](docs/MODEL-PRICE-ACCEPTANCE.md)。
+
 ## OpenCode / OpenAI-compatible 接入
 
 把网关作为 OpenAI-compatible provider，核心配置是：

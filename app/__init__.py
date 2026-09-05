@@ -131,6 +131,11 @@ def _seed_prices(app: FastAPI) -> None:
             latest = session.scalar(select(ModelPrice).where(
                 ModelPrice.model == model,
             ).order_by(ModelPrice.version.desc()))
+            if latest is not None and app.state.settings.gateway_mode == "managed_gateway":
+                # Environment prices bootstrap new models only. Restarting or
+                # rolling back an instance must not undo an operator price or
+                # re-list a deliberately unpublished model.
+                continue
             desired_input = int(config["input_microusd_per_million"])
             desired_output = int(config["output_microusd_per_million"])
             desired_limit = int(config.get("max_output_tokens", app.state.settings.max_output_tokens))
@@ -158,10 +163,14 @@ def _seed_prices(app: FastAPI) -> None:
             session.commit()
         except IntegrityError as exc:
             # Another process may have installed the exact same price version
-            # between our SELECT and INSERT. Roll back and accept only an
-            # identical active catalog; conflicting catalogs fail closed.
+            # between our SELECT and INSERT. Managed catalogs thereafter use
+            # DB versions; legacy modes require an identical active catalog.
             session.rollback()
             for model, config in app.state.settings.models.items():
+                if app.state.settings.gateway_mode == "managed_gateway" and session.scalar(
+                    select(ModelPrice.id).where(ModelPrice.model == model).limit(1)
+                ) is not None:
+                    continue
                 latest = session.scalar(select(ModelPrice).where(
                     ModelPrice.model == model,
                     ModelPrice.active.is_(True),
@@ -363,6 +372,8 @@ def create_app(
     static_dir = Path(__file__).resolve().parent / "static"
     from .ops_console import router as ops_console_router
     app.include_router(ops_console_router)
+    from .model_catalog import router as model_catalog_router
+    app.include_router(model_catalog_router)
     app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
     app.add_middleware(RequestBodyLimitMiddleware)
     if settings.captcha_required and settings.captcha_provider == "turnstile":
