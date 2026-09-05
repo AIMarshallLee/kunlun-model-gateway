@@ -51,6 +51,7 @@ def test_chargeback_risk_enters_existing_alerts_without_becoming_resolved_on_ack
         dispute(PaymentDomainService(db), order, amount=50)
     current = alerts(client)["chargeback_risk"]
     assert current["severity"] == "critical" and current["count"] == 1
+    assert current["destination"] == "chargebacks"
     assert safe_rules([current])[0]["rule"] == "chargeback_risk"
     assert ack(client, current).status_code == 201
     with client.app.state.SessionLocal() as db:

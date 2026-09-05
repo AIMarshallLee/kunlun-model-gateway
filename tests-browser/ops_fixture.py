@@ -3,6 +3,7 @@
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -13,7 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 from checkout_fixture import BrowserPaymentBridge
 from test_managed_gateway import OPS, managed, ready_call
-from app.models import ModelRequest
+from app.models import ModelRequest, PaymentChargeback, User, Wallet
+from app.services.payment_domain import PaymentDomainService
+from app.services.ledger import CUSTOMER_AVAILABLE, PLATFORM_CLEARING, post_transaction
 from app.services.ops_tokens import mint_operator_token
 from app.ops_alerts import collect_alerts
 from app.services.alert_notifications import queue_digest, dispatch_digest
@@ -40,6 +43,34 @@ if __name__ == "__main__":
         order = client.post("/billing/checkout", headers={**auth, "Idempotency-Key": "ops-order"}, json={"sku": "starter"})
         assert order.status_code == 201, order.text
         assert client.post("/billing/live/webhook", content=b"signed-provider-event").status_code == 200
+        chargebacks = {}
+        if "--chargebacks" in sys.argv:
+            for case in ("recover", "write_off", "pending", "recovered"):
+                with app.state.SessionLocal() as db:
+                    owner = str(uuid4())
+                    db.add(User(id=owner, email=f"{case}@example.invalid", password_hash="inert"))
+                    db.flush(); db.add(Wallet(user_id=owner)); db.commit()
+                    service = PaymentDomainService(db)
+                    paid = service.create_order(user_id=owner, provider="fixture", payment_amount_minor=100,
+                        payment_currency="USD", credit_amount_microusd=1000, quote_id="fixture-only",
+                        quote_numerator=10, quote_denominator=1, idempotency_key=case)
+                    service.apply_webhook(provider="fixture", event_id=f"paid-{case}", raw_digest="a" * 64,
+                        order_id=paid.id, event_type="payment.succeeded", status="paid", payment_amount_minor=100,
+                        payment_currency="USD", provider_transaction_id=f"txn-{case}")
+                    if case in {"recover", "write_off"}:
+                        db.get(Wallet, owner).balance_microusd -= 800
+                        post_transaction(db, user_id=owner, kind="fixture_spend", reference=case,
+                            idempotency_key=f"fixture-spend-{case}", entries=[(CUSTOMER_AVAILABLE, -800), (PLATFORM_CLEARING, 800)])
+                        db.commit()
+                    service.apply_webhook(provider="fixture", event_id=f"cb-{case}", raw_digest="b" * 64,
+                        order_id=paid.id, event_type="payment.charged_back", status="charged_back", payment_amount_minor=50 if case == "pending" else 100,
+                        payment_currency="USD", provider_transaction_id=f"txn-{case}", provider_dispute_id=f"dispute-{case}")
+                    if case == "recover":
+                        db.get(Wallet, owner).balance_microusd += 800
+                        post_transaction(db, user_id=owner, kind="fixture_credit", reference=case,
+                            idempotency_key="fixture-recovery-credit", entries=[(CUSTOMER_AVAILABLE, 800), (PLATFORM_CLEARING, -800)])
+                        db.commit()
+                    chargebacks[case] = db.scalar(select(PaymentChargeback.id).where(PaymentChargeback.order_id == paid.id))
         with app.state.SessionLocal() as db:
             requests = {row.idempotency_key: row.id for row in db.scalars(select(ModelRequest))}
             observation = collect_alerts(db, app.state.settings, app.state.platform_vault)
@@ -54,7 +85,7 @@ if __name__ == "__main__":
             if profile == "write":
                 scopes |= {"alerts:write", "accounts:write", "payments:write", "reconciliation:write", "payments:risk:write", "models:write"}
             return {"token": mint_operator_token(OPS, subject="synthetic-operator", scopes=scopes, ttl_seconds=300),
-                    "requests": requests, "order_id": bridge.webhook.order_id}
+                    "requests": requests, "order_id": bridge.webhook.order_id, "chargebacks": chargebacks}
 
         @app.get("/__fixture__/refund-calls")
         def refund_calls():

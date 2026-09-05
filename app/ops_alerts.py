@@ -66,7 +66,7 @@ def collect_alerts(db, settings, vault, *, now=None):
     group("payment_risk", "warning", PaymentOrder, PaymentOrder.risk_reason.is_not(None), "orders")
     group("refund_risk", "critical", PaymentRefund, PaymentRefund.status == "risk", "orders")
     group("chargeback_risk", "critical", PaymentChargeback,
-          PaymentChargeback.status.in_(("risk", "pending_reconciliation")), "orders")
+          PaymentChargeback.status.in_(("risk", "pending_reconciliation")), "chargebacks")
     period = now.date().isoformat()
     budget = db.get(PlatformDailyBudget, period)
     limit = min(budget.limit_microusd, settings.platform_daily_budget_microusd) if budget else settings.platform_daily_budget_microusd

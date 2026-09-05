@@ -9,6 +9,7 @@ const modules = [
   {id: "notifications", scope: "alerts:read", en: "Notification records", zh: "通知投递记录", path: "/ops/notifications", field: "items"},
   {id: "accounts", scope: "accounts:read", en: "Accounts & keys", zh: "客户与 Key", path: "/ops/accounts", detail: "/ops/accounts/", field: "items"},
   {id: "orders", scope: "payments:read", en: "Orders & refunds", zh: "订单与退款", path: "/ops/orders", detail: "/ops/orders/", field: "items"},
+  {id: "chargebacks", scope: "payments:read", en: "Chargebacks", zh: "拒付处理", path: "/ops/chargebacks", detail: "/ops/chargebacks/", field: "items"},
   {id: "requests", scope: "reconciliation:read", en: "Model reconciliation", zh: "模型对账", path: "/ops/reconciliation", detail: "/ops/requests/", field: "requests"},
   {id: "models", scope: "models:read", en: "Models & retail prices", zh: "模型与售价", path: "/ops/models", detail: "/ops/models/", field: "items"},
   {id: "channels", scope: "channels:read", en: "Supply status", zh: "渠道状态", path: "/ops/channels", field: "channels"},
@@ -22,6 +23,7 @@ const alertLabels = {
   refund_reconciliation: ["Refund outcome needs verification", "退款结果待核验"],
   payment_risk: ["Payment risk notes need review", "订单风险标记待核查"],
   refund_risk: ["Refund credit shortfall", "退款额度不足风险"],
+  chargeback_risk: ["Chargeback shortfall or reconciliation", "拒付差额或待对账"],
   platform_budget: ["Platform cost budget threshold", "平台成本预算触阈"],
   supply_observation_failed: ["Supply state could not be read", "供给状态无法读取"],
   supply_unavailable: ["Listed models have no active supply", "已上架模型缺少启用供给"],
@@ -30,6 +32,11 @@ const alertLabels = {
 const alertTitle = (id) => alertLabels[id]?.[language === "en" ? 0 : 1] || id;
 const say = (en, zh) => language === "en" ? en : zh;
 const has = (scope) => identity?.scopes.includes(scope);
+const chargebackAmounts = ["payment_amount_minor", "credit_amount_microusd", "recovered_microusd", "outstanding_microusd", "written_off_microusd"];
+const exactChargeback = (row) => chargebackAmounts.every((key) => Number.isSafeInteger(row[key]) && row[key] >= 0);
+const chargebackStatus = (status) => ({risk: say("Confirmed shortfall", "已确认差额"),
+  pending_reconciliation: say("Reconciliation required", "待对账"), recovered: say("Original credit recovered", "原额度已追回"),
+  resolved: say("Shortfall disposed — account not auto-unfrozen", "差额已处置 — 不自动解冻")})[status] || status;
 const notice = (text) => { byId("notice").textContent = text; };
 const showJSON = (id, data) => { byId(id).textContent = JSON.stringify(data, null, 2); };
 function setActionBusy(value) {
@@ -43,6 +50,7 @@ function clearSelection() {
   byId("snapshot").textContent = ""; byId("result").textContent = "";
   byId("object-facts").replaceChildren();
   byId("alert-context").hidden = true;
+  byId("chargeback-context").hidden = true; byId("chargeback-state").textContent = "";
   byId("action-form").hidden = true; byId("action-form").reset(); byId("object-id").value = "";
 }
 function lock() {
@@ -74,9 +82,24 @@ function renderChrome() {
 }
 function renderFacts() {
   if (!selected) return;
-  const {data, kind} = selected, row = data.account || data.order || data.request || data.model || data.alert;
+  const {data, kind} = selected, row = data.account || data.order || data.request || data.model || data.alert || data.chargeback;
   const facts = [[say("Object ID", "对象 ID"), row.id], [say("Status", "状态"), kind === "models" ? (row.active ? say("Listed", "已上架") : say("Unlisted", "已下架")) : row.status]];
   byId("alert-context").hidden = kind !== "alerts";
+  byId("chargeback-context").hidden = kind !== "chargebacks";
+  byId("general-action-context").hidden = kind === "chargebacks";
+  if (kind === "chargebacks") {
+    const amount = (field, unit = "microUSD") => Number.isSafeInteger(row[field]) && row[field] >= 0 ? `${row[field]} ${unit}` : say("Cannot display exactly — do not act", "无法精确展示 — 禁止操作");
+    facts[1][1] = chargebackStatus(row.status);
+    facts.push([say("Source order", "原订单"), row.order_id], [say("Customer ID", "客户 ID"), row.user_id],
+      [say("Payment provider / dispute", "支付渠道 / 争议号"), `${row.provider} / ${row.provider_dispute_id}`],
+      [say("Cash debit principal (minor units)", "现金扣款本金（最小货币单位）"), amount("payment_amount_minor", `${row.payment_currency} ${say("minor units", "最小单位")}`)],
+      [say("Original service credit", "原购买服务额度"), amount("credit_amount_microusd")],
+      [say("Recovered credit", "累计追回额度"), amount("recovered_microusd")],
+      [say("Confirmed outstanding shortfall", "已确认未处置差额"), amount("outstanding_microusd")],
+      [say("Written off as platform loss", "已核销为平台损失"), amount("written_off_microusd")],
+      [say("Risk reason", "风险原因"), row.risk_reason || "—"]);
+    byId("chargeback-state").textContent = !exactChargeback(row) ? say("An amount exceeds safe browser integer precision. Actions are blocked; verify the exact ledger using approved tooling.", "金额超出浏览器安全整数精度，已禁止操作；请用受控工具核对精确账本。") : row.status === "pending_reconciliation" ? say("Reconciliation required. Zero recorded credit shortfall is not zero cash loss. Partial or overlapping events cannot be written off here.", "此记录待对账。已记录额度差额为零，不等于现金损失为零；部分或重叠事件不能在此直接核销。") : row.status === "risk" ? say("Only confirmed shortfall can be disposed here. The server must verify that model holds are cleared and the ledger agrees; this page is a snapshot, not permission to bypass those checks.", "此处仅处理已确认差额。服务端仍须核验模型占用已清空、账本一致；页面快照不能绕过这些检查。") : say("No further financial action is available for this state. Account unfreeze is a separate audited decision and never restores old keys.", "此状态无后续财务操作。账户解冻须另行审核，不会恢复旧 Key。");
+  }
   if (kind === "alerts") {
     facts.push([say("Condition", "告警条件"), alertTitle(row.id)], [say("Severity", "级别"), row.severity],
       [say("Affected count", "涉及数量"), row.count], [say("Observed at", "观察时间"), data.observed_at],
@@ -118,7 +141,7 @@ async function load() {
   byId("records").replaceChildren(); byId("lookup").hidden = !active.detail;
   byId("next").disabled = true; byId("previous").disabled = true; byId("page").textContent = "";
   try {
-    const paginated = ["accounts", "orders", "requests", "models", "notifications", "audit"].includes(active.id);
+    const paginated = ["accounts", "orders", "chargebacks", "requests", "models", "notifications", "audit"].includes(active.id);
     const data = await client.request(active.path + (paginated ? `?limit=20&offset=${offset}` : ""));
     if (current !== epoch) return;
     const rows = active.field ? data[active.field] : [data];
@@ -148,8 +171,9 @@ async function inspect(id) {
   if (!active?.detail || executing) return;
   const current = ++epoch; clearSelection(); notice(""); byId("object-id").value = id;
   try {
-    const data = await client.request(active.detail + encodeURIComponent(id));
+    const response = await client.request(active.detail + encodeURIComponent(id));
     if (current !== epoch) return;
+    const data = active.id === "chargebacks" ? {chargeback: response} : response;
     selected = {id, kind: active.id, data}; showJSON("snapshot", data); renderFacts(); renderActions();
     if (selected.kind === "models") {
       byId("retail-input").value = data.model.input_microusd_per_million;
@@ -171,6 +195,13 @@ function buildActions() {
       {action: "publish", expected_version: row.version, operation_id: crypto.randomUUID()}, row.model, state, false, true);
     if (row.active) add("Unlist model", "下架模型", path,
       {action: "unpublish", expected_version: row.version, operation_id: crypto.randomUUID()}, row.model, state);
+  }
+  if (kind === "chargebacks" && has("payments:risk:write") && data.chargeback.status === "risk" && exactChargeback(data.chargeback) && data.chargeback.outstanding_microusd > 0) {
+    const path = `/ops/chargebacks/${encodeURIComponent(id)}/risk-disposition`;
+    add("Recover confirmed shortfall", "全额追回已确认差额", path,
+      {action: "recover_available", idempotency_key: crypto.randomUUID()}, id, data.chargeback.status);
+    add("Recover available and write off remainder", "追回可用额度并核销剩余差额", path,
+      {action: "write_off", idempotency_key: crypto.randomUUID()}, id, data.chargeback.status);
   }
   if (kind === "accounts" && has("accounts:write")) {
     const account = data.account;
@@ -268,6 +299,8 @@ byId("action-form").addEventListener("submit", (event) => {
     }
   }
   command = {path: action.path, body, target: action.target, observed_state: action.state};
+  if (selected?.kind === "chargebacks") command.observed_financials = {payment_currency: selected.data.chargeback.payment_currency,
+    source_order_id: selected.data.chargeback.order_id, ...Object.fromEntries(chargebackAmounts.map((key) => [key, selected.data.chargeback[key]]))};
   showJSON("command-preview", command); byId("confirmation").hidden = false; byId("confirm").disabled = false;
 });
 byId("cancel").addEventListener("click", cancelCommand);
@@ -288,6 +321,7 @@ byId("confirm").addEventListener("click", async () => {
       // Keep the submitted command/reference visible, including after timeout.
       byId("object-facts").replaceChildren(); byId("snapshot").textContent = "";
       byId("alert-context").hidden = true;
+      byId("chargeback-context").hidden = true;
       selected = null; renderChrome();
     }
   }
