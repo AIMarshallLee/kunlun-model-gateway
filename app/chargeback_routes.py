@@ -39,6 +39,16 @@ def list_returns(request: Request, limit: int = Query(50, ge=1, le=200),
         return {"items": [project_return(row) for row in rows], "pagination": {"limit": limit, "offset": offset, "total": total}}
 
 
+@router.get("/ops/chargeback-returns/{return_id}")
+def get_return(return_id: str, request: Request,
+               _operator=Depends(require_operator_scope("payments:read"))):
+    with request.app.state.SessionLocal() as db:
+        row = db.get(PaymentChargebackReturn, return_id)
+        if row is None:
+            raise HTTPException(404, "拒付返还记录不存在")
+        return project_return(row)
+
+
 def project(row):
     return {field: getattr(row, field) for field in (
         "id", "order_id", "user_id", "provider", "provider_dispute_id", "payment_amount_minor",

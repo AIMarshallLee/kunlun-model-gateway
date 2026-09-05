@@ -186,3 +186,30 @@ def test_return_transaction_failure_rolls_back_wallet_and_evidence(session):
     assert db.scalar(select(func.count(PaymentChargebackReturn.id))) == 0
     assert db.scalar(select(PaymentChargeback)).status == "recovered"
     assert returned(service, order) is False
+
+
+def test_return_detail_requires_payment_scope_and_matches_list(tmp_path):
+    from tests.test_live_payment_routes import FakeLiveBridge, OPS_SECRET, _client
+    from app.services.ops_tokens import mint_operator_token
+    from app.models import PaymentChargebackReturn
+    app, client, customer = _client(tmp_path, FakeLiveBridge())
+    try:
+        with app.state.SessionLocal() as db:
+            order = paid_order(db, db.scalar(select(User.id)))
+            returned(PaymentDomainService(db), order)
+            record_id = db.scalar(select(PaymentChargebackReturn.id))
+        url = f"/ops/chargeback-returns/{record_id}"
+        assert client.get(url, headers=customer).status_code == 401
+        def ops(scopes):
+            return {"X-Kunlun-Ops-Token": mint_operator_token(OPS_SECRET, subject="test-read", scopes=scopes)}
+        assert client.get(url, headers=ops({"accounts:read"})).status_code == 401
+        read = ops({"payments:read"})
+        result = client.get(url, headers=read)
+        assert result.status_code == 200
+        assert "no-store" in result.headers["cache-control"]
+        assert result.json() == client.get("/ops/chargeback-returns", headers=read).json()["items"][0]
+        assert result.json()["chargeback_id"] is None
+        assert client.get("/ops/chargeback-returns/absent", headers=read).status_code == 404
+        assert client.post(url, headers=read, json={"status": "applied"}).status_code == 405
+    finally:
+        client.__exit__(None, None, None)

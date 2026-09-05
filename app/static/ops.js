@@ -4,12 +4,14 @@ const byId = (id) => document.getElementById(id);
 const client = createOpsClient();
 let language = "en", identity = null, active = null, offset = 0, selected = null, actions = [], command = null;
 let epoch = 0, expiryTimer = null, executing = false;
+let returnOrderFilter = "";
 const modules = [
   {id: "alerts", scope: "alerts:read", en: "Operational alerts", zh: "运营告警", path: "/ops/alerts", detail: "/ops/alerts/", field: "items"},
   {id: "notifications", scope: "alerts:read", en: "Notification records", zh: "通知投递记录", path: "/ops/notifications", field: "items"},
   {id: "accounts", scope: "accounts:read", en: "Accounts & keys", zh: "客户与 Key", path: "/ops/accounts", detail: "/ops/accounts/", field: "items"},
   {id: "orders", scope: "payments:read", en: "Orders & refunds", zh: "订单与退款", path: "/ops/orders", detail: "/ops/orders/", field: "items"},
   {id: "chargebacks", scope: "payments:read", en: "Chargebacks", zh: "拒付处理", path: "/ops/chargebacks", detail: "/ops/chargebacks/", field: "items"},
+  {id: "returns", scope: "payments:read", en: "Chargeback returns", zh: "拒付资金返还", path: "/ops/chargeback-returns", detail: "/ops/chargeback-returns/", field: "items"},
   {id: "requests", scope: "reconciliation:read", en: "Model reconciliation", zh: "模型对账", path: "/ops/reconciliation", detail: "/ops/requests/", field: "requests"},
   {id: "models", scope: "models:read", en: "Models & retail prices", zh: "模型与售价", path: "/ops/models", detail: "/ops/models/", field: "items"},
   {id: "channels", scope: "channels:read", en: "Supply status", zh: "渠道状态", path: "/ops/channels", field: "channels"},
@@ -34,6 +36,8 @@ const say = (en, zh) => language === "en" ? en : zh;
 const has = (scope) => identity?.scopes.includes(scope);
 const chargebackAmounts = ["payment_amount_minor", "credit_amount_microusd", "recovered_microusd", "outstanding_microusd", "written_off_microusd"];
 const exactChargeback = (row) => chargebackAmounts.every((key) => Number.isSafeInteger(row[key]) && row[key] >= 0);
+const returnAmounts = ["payment_amount_minor", "restored_microusd", "canceled_risk_microusd", "reversed_loss_microusd"];
+const returnStatus = (status) => status === "applied" ? say("Restoration applied — account not auto-unfrozen", "返还已入账 — 不自动解冻") : status === "pending_reconciliation" ? say("Reconciliation required", "待对账") : status;
 const chargebackStatus = (status) => ({risk: say("Confirmed shortfall", "已确认差额"),
   pending_reconciliation: say("Reconciliation required", "待对账"), recovered: say("Original credit recovered", "原额度已追回"),
   resolved: say("Shortfall disposed — account not auto-unfrozen", "差额已处置 — 不自动解冻")})[status] || status;
@@ -51,11 +55,14 @@ function clearSelection() {
   byId("object-facts").replaceChildren();
   byId("alert-context").hidden = true;
   byId("chargeback-context").hidden = true; byId("chargeback-state").textContent = "";
+  byId("return-context").hidden = true; byId("return-state").textContent = "";
+  byId("financial-links").replaceChildren();
   byId("action-form").hidden = true; byId("action-form").reset(); byId("object-id").value = "";
 }
 function lock() {
   client.logout(); identity = null; active = null; epoch += 1; setActionBusy(false); clearTimeout(expiryTimer);
   clearSelection(); byId("records").replaceChildren(); byId("modules").replaceChildren();
+  returnOrderFilter = ""; byId("return-order-id").value = ""; byId("return-filter").hidden = true;
   byId("identity").textContent = ""; byId("environment").textContent = ""; byId("operator-token").value = "";
   byId("desk").hidden = true; byId("access").hidden = false;
 }
@@ -74,7 +81,7 @@ function renderChrome() {
     const button = document.createElement("button"); button.type = "button"; button.textContent = item[language];
     if (active?.id === item.id) button.setAttribute("aria-current", "page");
     button.disabled = executing;
-    button.addEventListener("click", () => { active = item; offset = 0; load(); }); return button;
+    button.addEventListener("click", () => { active = item; offset = 0; returnOrderFilter = ""; load(); }); return button;
   }));
   if (active) byId("module-title").textContent = active[language];
   renderFacts();
@@ -82,11 +89,43 @@ function renderChrome() {
 }
 function renderFacts() {
   if (!selected) return;
-  const {data, kind} = selected, row = data.account || data.order || data.request || data.model || data.alert || data.chargeback;
+  const {data, kind} = selected, row = data.account || data.order || data.request || data.model || data.alert || data.chargeback || data.return;
   const facts = [[say("Object ID", "对象 ID"), row.id], [say("Status", "状态"), kind === "models" ? (row.active ? say("Listed", "已上架") : say("Unlisted", "已下架")) : row.status]];
   byId("alert-context").hidden = kind !== "alerts";
   byId("chargeback-context").hidden = kind !== "chargebacks";
-  byId("general-action-context").hidden = kind === "chargebacks";
+  byId("return-context").hidden = kind !== "returns";
+  byId("general-action-context").hidden = ["chargebacks", "returns"].includes(kind);
+  const links = [];
+  const related = (en, zh, destination, objectId = null, orderFilter = "") => {
+    if (!modules.some((item) => item.id === destination && has(item.scope))) return;
+    const button = document.createElement("button"); button.type = "button"; button.textContent = say(en, zh);
+    button.dataset.destination = destination; button.disabled = executing;
+    button.addEventListener("click", () => navigateRelated(destination, objectId, orderFilter)); links.push(button);
+  };
+  if (["chargebacks", "returns"].includes(kind)) related("Inspect source order", "核查原订单", "orders", row.order_id);
+  if (kind === "returns" && row.chargeback_id) related("Inspect linked chargeback", "核查关联拒付", "chargebacks", row.chargeback_id);
+  if (["orders", "chargebacks"].includes(kind)) related("View returns for this order", "查看此订单的返还", "returns", null, kind === "orders" ? row.id : row.order_id);
+  byId("financial-links").replaceChildren(...links);
+  if (kind === "returns") {
+    const amount = (field, unit = "microUSD") => Number.isSafeInteger(row[field]) && row[field] >= 0 ? `${row[field]} ${unit}` : say("Cannot display exactly — verify ledger", "无法精确展示 — 请核对账本");
+    facts[1][1] = returnStatus(row.status);
+    facts.push([say("Source order", "原订单"), row.order_id], [say("Customer ID", "客户 ID"), row.user_id],
+      [say("Payment provider / dispute", "支付渠道 / 争议号"), `${row.provider} / ${row.provider_dispute_id}`],
+      [say("Provider funds-return ID", "支付方资金返还号"), row.provider_return_id],
+      [say("Linked chargeback", "关联拒付"), row.chargeback_id || say("Not matched", "尚未匹配")],
+      [say("Returned cash principal (minor units)", "返还现金本金（最小货币单位）"), amount("payment_amount_minor", `${row.payment_currency} ${say("minor units", "最小单位")}`)],
+      [say("Restored available credit", "已恢复可用额度"), amount("restored_microusd")],
+      [say("Canceled outstanding risk", "已取消风险差额"), amount("canceled_risk_microusd")],
+      [say("Reversed platform loss", "已冲回平台损失"), amount("reversed_loss_microusd")],
+      [say("Risk reason", "风险原因"), row.risk_reason || "—"],
+      [say("Recorded at (UTC)", "记录时间（UTC）"), row.created_at],
+      [say("Applied at (UTC)", "入账时间（UTC）"), row.applied_at || "—"]);
+    byId("return-state").textContent = !returnAmounts.every((field) => Number.isSafeInteger(row[field]) && row[field] >= 0)
+      ? say("An amount exceeds safe browser integer precision. Verify the exact ledger using approved tooling; rounded browser metadata is not financial evidence.", "金额超出浏览器安全整数精度。请用受控工具核对精确账本，浏览器舍入后的元数据不能作为财务依据。")
+      : row.status === "applied"
+        ? say("The recorded return has been applied to the credit ledger. Only previously recovered credit was restored; consumed credit is not granted again. This does not unfreeze the account or revive keys.", "此返还已按记录计入额度账本。仅补回此前实际追回的额度，不重复赠送已消费额度；不会解冻账户或恢复旧 Key。")
+        : say("Reconciliation required. Zero restored credit is not proof that no cash returned. Verify the original payment, debit and return records; do not issue another refund or manually add credit.", "此记录待对账。恢复额度为零，不代表现金未返还；请核对原支付、扣款及返还记录，不要再发起退款或手工加额度。");
+  }
   if (kind === "chargebacks") {
     const amount = (field, unit = "microUSD") => Number.isSafeInteger(row[field]) && row[field] >= 0 ? `${row[field]} ${unit}` : say("Cannot display exactly — do not act", "无法精确展示 — 禁止操作");
     facts[1][1] = chargebackStatus(row.status);
@@ -138,11 +177,15 @@ function renderFacts() {
 async function load() {
   if (!active || executing) return;
   const current = ++epoch; clearSelection(); notice(""); renderChrome();
+  byId("return-filter").hidden = active.id !== "returns";
+  byId("return-order-id").value = returnOrderFilter;
   byId("records").replaceChildren(); byId("lookup").hidden = !active.detail;
   byId("next").disabled = true; byId("previous").disabled = true; byId("page").textContent = "";
   try {
-    const paginated = ["accounts", "orders", "chargebacks", "requests", "models", "notifications", "audit"].includes(active.id);
-    const data = await client.request(active.path + (paginated ? `?limit=20&offset=${offset}` : ""));
+    const paginated = ["accounts", "orders", "chargebacks", "returns", "requests", "models", "notifications", "audit"].includes(active.id);
+    const query = paginated ? new URLSearchParams({limit: "20", offset: String(offset)}) : new URLSearchParams();
+    if (active.id === "returns" && returnOrderFilter) query.set("order_id", returnOrderFilter);
+    const data = await client.request(active.path + (query.size ? `?${query}` : ""));
     if (current !== epoch) return;
     const rows = active.field ? data[active.field] : [data];
     const total = data.pagination?.total ?? rows.length;
@@ -165,7 +208,15 @@ async function load() {
       button.addEventListener("click", () => active.detail ? inspect(row.id || row.request_id) : showJSON("snapshot", row));
       return button;
     }));
+    return true;
   } catch (error) { if (current === epoch) errorNotice(error); }
+}
+async function navigateRelated(destinationId, objectId, orderFilter) {
+  if (executing) return;
+  const destination = modules.find((item) => item.id === destinationId && has(item.scope));
+  if (!destination) return;
+  active = destination; offset = 0; returnOrderFilter = orderFilter;
+  if (await load() && objectId) await inspect(objectId);
 }
 async function inspect(id) {
   if (!active?.detail || executing) return;
@@ -173,7 +224,7 @@ async function inspect(id) {
   try {
     const response = await client.request(active.detail + encodeURIComponent(id));
     if (current !== epoch) return;
-    const data = active.id === "chargebacks" ? {chargeback: response} : response;
+    const data = active.id === "chargebacks" ? {chargeback: response} : active.id === "returns" ? {return: response} : response;
     selected = {id, kind: active.id, data}; showJSON("snapshot", data); renderFacts(); renderActions();
     if (selected.kind === "models") {
       byId("retail-input").value = data.model.input_microusd_per_million;
@@ -217,7 +268,7 @@ function buildActions() {
     }
   }
   if (kind === "orders") {
-    if (has("payments:write")) {
+    if (has("payments:write") && data.order.risk_reason !== "chargeback_return_reconciliation") {
       add("Query payment provider", "向支付方核查", `/ops/payments/${encodeURIComponent(id)}/reconcile`, {}, id, data.order.status);
       if (data.order.status === "paid" || data.refunds.some((item) => ["requesting", "retrying", "pending_reconciliation"].includes(item.status))) {
         const retry = data.refunds.find((item) => ["requesting", "retrying", "pending_reconciliation"].includes(item.status));
@@ -270,7 +321,15 @@ byId("language").addEventListener("click", () => {
 byId("alert-destination").addEventListener("click", () => {
   if (executing || !selected?.data.alert) return;
   const destination = modules.find((item) => item.id === selected.data.alert.destination && has(item.scope));
-  if (destination) { active = destination; offset = 0; load(); }
+  if (destination) { active = destination; offset = 0; returnOrderFilter = ""; load(); }
+});
+byId("return-filter").addEventListener("submit", (event) => {
+  event.preventDefault(); if (executing || active?.id !== "returns") return;
+  returnOrderFilter = byId("return-order-id").value.trim(); offset = 0; load();
+});
+byId("return-filter-clear").addEventListener("click", () => {
+  if (executing || active?.id !== "returns") return;
+  returnOrderFilter = ""; offset = 0; load();
 });
 byId("refresh").addEventListener("click", load);
 byId("previous").addEventListener("click", () => { offset = Math.max(0, offset - 20); load(); });
@@ -322,6 +381,7 @@ byId("confirm").addEventListener("click", async () => {
       byId("object-facts").replaceChildren(); byId("snapshot").textContent = "";
       byId("alert-context").hidden = true;
       byId("chargeback-context").hidden = true;
+      byId("return-context").hidden = true; byId("financial-links").replaceChildren();
       selected = null; renderChrome();
     }
   }
