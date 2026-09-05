@@ -59,6 +59,8 @@ Key 创建支持可选模型范围、单次输出上限和累计消费上限；�
 
 ## OpenCode / OpenAI-compatible 接入
 
+自有工具可从[可运行 Python 接入样例](docs/OWN-TOOL-INTEGRATION.md)开始：默认预览，显式执行才调用模型；覆盖非流式、SSE、工具字段透传和原任务查询。仅为隔离模拟验收样例，不代表真实客户接入。
+
 把网关作为 OpenAI-compatible provider，核心配置是：
 
 ```json
