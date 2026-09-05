@@ -1178,6 +1178,7 @@ def create_app(
                     provider_transaction_id=event.provider_transaction_id,
                     provider_refund_id=event.provider_refund_id,
                     provider_dispute_id=event.provider_dispute_id,
+                    provider_return_id=event.provider_return_id,
                 )
             except PaymentDomainError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -2043,6 +2044,12 @@ def create_app(
                 ).limit(1))
                 if unresolved_chargeback is not None:
                     raise HTTPException(status_code=409, detail="拒付差额或待对账尚未处置，禁止解除冻结")
+                from .models import PaymentChargebackReturn
+                if session.scalar(select(PaymentChargebackReturn.id).where(
+                    PaymentChargebackReturn.user_id == user_id,
+                    PaymentChargebackReturn.status == "pending_reconciliation",
+                ).limit(1)):
+                    raise HTTPException(status_code=409, detail="拒付返还尚待对账，禁止解除冻结")
                 user.status = "active"
                 after_status = "active"
             # Unfreezing deliberately does not restore sessions or API keys;

@@ -57,7 +57,7 @@ Key 创建支持可选模型范围、单次输出上限和累计消费上限；�
 
 新增默认只预览的[告警邮件摘要 worker](docs/ALERT-NOTIFICATION-ACCEPTANCE.md)，复用持久化 outbox 与 SMTP，限制重复发送并保留未知结果。真实收件人/调度尚未启用，SMTP accepted 不等于收件箱送达。
 
-商业财务链路新增[独立拒付记录、冲正、风险处置 API 与运营界面](docs/CHARGEBACK-ACCEPTANCE.md)，schema head 为 `0016_chargebacks`。部分/重叠事件保留待对账；正式支付 SDK、返还处理与真实运营验收仍未完成。
+商业财务链路包含[独立拒付记录、冲正、风险处置 API 与运营界面](docs/CHARGEBACK-ACCEPTANCE.md)，以及确认全额资金返还的幂等账务处理和只读查询，schema head 为 `0017_chargeback_returns`。部分/重叠事件保留待对账；正式支付 SDK、原生事件映射与真实运营验收仍未完成。
 
 ## OpenCode / OpenAI-compatible 接入
 

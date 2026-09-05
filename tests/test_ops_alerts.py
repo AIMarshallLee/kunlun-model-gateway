@@ -58,6 +58,25 @@ def test_chargeback_risk_enters_existing_alerts_without_becoming_resolved_on_ack
         assert db.scalar(select(PaymentChargeback.status)) == "pending_reconciliation"
 
 
+def test_early_chargeback_return_uses_payment_risk_alert_until_matched(managed):
+    from app.models import User
+    from app.services.payment_domain import PaymentDomainService
+    from tests.test_chargebacks import paid_order, dispute
+    from tests.test_chargeback_returns import returned
+    client, _, _ = ready_call(managed)
+    with client.app.state.SessionLocal() as db:
+        order = paid_order(db, db.scalar(select(User.id)))
+        order_id = order.id
+        returned(PaymentDomainService(db), order)
+    current = alerts(client)["payment_risk"]
+    assert current["count"] == 1 and current["destination"] == "orders"
+    assert ack(client, current).status_code == 201
+    assert "payment_risk" in alerts(client)
+    with client.app.state.SessionLocal() as db:
+        dispute(PaymentDomainService(db), db.get(PaymentOrder, order_id))
+    assert "payment_risk" not in alerts(client)
+
+
 def test_ack_is_a_receipt_not_resolution_or_wallet_release(managed):
     client, headers, payload = ready_call(managed)
     client.app.state.test_upstream = lambda request: httpx.Response(500, json={"error": "never log this private upstream detail"})

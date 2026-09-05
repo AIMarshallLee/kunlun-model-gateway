@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models import (
-    LedgerEntry, LedgerTransaction, OutboxEvent, PaymentChargeback, PaymentOrder, PaymentRefund,
+    LedgerEntry, LedgerTransaction, OutboxEvent, PaymentChargeback, PaymentChargebackReturn, PaymentOrder, PaymentRefund,
     PaymentWebhookEvent, User, Wallet,
 )
 from ..security import as_utc, utcnow
@@ -249,6 +249,7 @@ class PaymentDomainService:
         payment_currency: str, provider_transaction_id: str, nonce: str | None = None,
         provider_refund_id: str | None = None,
         provider_dispute_id: str | None = None,
+        provider_return_id: str | None = None,
     ) -> bool:
         """Persist an already-authenticated event and apply it exactly once."""
         nonce = nonce or event_id
@@ -270,7 +271,7 @@ class PaymentDomainService:
             raise PaymentDomainError("支付回调 nonce 已被使用", 409)
         # Cash reversal and model admission share User -> Order -> Wallet.
         # Acquire User before Order on both reversal webhook paths.
-        if event_type in {"payment.refunded", "payment.charged_back"}:
+        if event_type in {"payment.refunded", "payment.charged_back", "payment.chargeback_returned"}:
             owner_id = self.session.scalar(select(PaymentOrder.user_id).where(PaymentOrder.id == order_id))
             self.session.scalar(select(User).where(User.id == owner_id).with_for_update())
         order = self.session.scalar(
@@ -282,8 +283,9 @@ class PaymentDomainService:
         if order is None or order.provider != provider:
             raise PaymentDomainError("支付订单不存在", 404)
         chargeback = event_type == "payment.charged_back"
+        chargeback_return = event_type == "payment.chargeback_returned"
         if (type(payment_amount_minor) is not int or payment_amount_minor <= 0 or
-                (not chargeback and payment_amount_minor != order.payment_amount_minor) or
+                (not (chargeback or chargeback_return) and payment_amount_minor != order.payment_amount_minor) or
                 payment_currency != order.payment_currency):
             raise PaymentDomainError("支付金额或币种与订单报价不一致", 409)
         if (
@@ -299,6 +301,7 @@ class PaymentDomainService:
             "topup.succeeded": "paid",
             "payment.refunded": "refunded",
             "payment.charged_back": "charged_back",
+            "payment.chargeback_returned": "chargeback_returned",
         }
         if valid_event.get(event_type) != status:
             raise PaymentDomainError("支付事件类型与状态不一致", 409)
@@ -306,22 +309,44 @@ class PaymentDomainService:
             raise PaymentDomainError("退款事件缺少供应商退款标识", 422)
         if status != "refunded" and provider_refund_id is not None:
             raise PaymentDomainError("非退款事件不得携带退款标识", 409)
-        if chargeback and not provider_dispute_id:
+        if (chargeback or chargeback_return) and not provider_dispute_id:
             raise PaymentDomainError("拒付事件缺少供应商争议标识", 422)
-        if not chargeback and provider_dispute_id is not None:
+        if not (chargeback or chargeback_return) and provider_dispute_id is not None:
             raise PaymentDomainError("非拒付事件不得携带争议标识", 409)
+        if chargeback_return and not provider_return_id:
+            raise PaymentDomainError("返还事件缺少供应商资金返还标识", 422)
+        if not chargeback_return and provider_return_id is not None:
+            raise PaymentDomainError("非返还事件不得携带资金返还标识", 409)
         event = PaymentWebhookEvent(
             id=str(uuid.uuid4()), provider=provider, event_id=event_id,
             nonce=nonce, order_id=order.id, raw_digest=raw_digest, event_type=event_type,
             status="processed",
         )
         self.session.add(event)
+        if chargeback_return:
+            from .chargeback_returns import record_chargeback_return
+            try:
+                order.provider_transaction_id = order.provider_transaction_id or provider_transaction_id
+                duplicate, row = record_chargeback_return(self.session, order,
+                    provider_dispute_id=provider_dispute_id, provider_return_id=provider_return_id,
+                    payment_amount_minor=payment_amount_minor)
+                event.status = ("processed_duplicate" if duplicate else
+                                "processed" if row.status == "applied" else "pending_reconciliation")
+                self.session.commit()
+            except IntegrityError as exc:
+                self.session.rollback()
+                raise PaymentDomainError("拒付返还并发冲突，请用原事件重试", 409) from exc
+            return duplicate
         if chargeback:
             from .chargebacks import record_chargeback
             try:
                 order.provider_transaction_id = order.provider_transaction_id or provider_transaction_id
                 duplicate = record_chargeback(self.session, order, provider_dispute_id=provider_dispute_id,
                                                payment_amount_minor=payment_amount_minor)
+                if not duplicate:
+                    from .chargeback_returns import match_early_return
+                    self.session.flush()
+                    match_early_return(self.session, order)
                 event.status = "processed_duplicate" if duplicate else "processed"
                 self.session.commit()
             except IntegrityError as exc:
@@ -464,6 +489,8 @@ class PaymentDomainService:
         self.session.scalar(select(PaymentOrder).where(PaymentOrder.id == order_id).with_for_update())
         if self.session.scalar(select(PaymentChargeback.id).where(PaymentChargeback.order_id == order_id).limit(1)):
             raise PaymentDomainError("订单存在拒付记录，禁止自动发起或重试退款", 409)
+        if self.session.scalar(select(PaymentChargebackReturn.id).where(PaymentChargebackReturn.order_id == order_id).limit(1)):
+            raise PaymentDomainError("订单存在拒付返还记录，禁止自动发起或重试退款", 409)
         existing = self.session.scalar(select(PaymentRefund).where(
             PaymentRefund.order_id == order_id, PaymentRefund.idempotency_key == idempotency_key,
         ))

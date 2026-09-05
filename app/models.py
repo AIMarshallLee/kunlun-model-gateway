@@ -446,6 +446,33 @@ class PaymentChargeback(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class PaymentChargebackReturn(Base):
+    __tablename__ = "payment_chargeback_returns"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_return_id", name="uq_chargeback_return_provider_id"),
+        CheckConstraint("payment_amount_minor > 0", name="chargeback_return_amount_positive"),
+        CheckConstraint("restored_microusd >= 0 AND canceled_risk_microusd >= 0 AND reversed_loss_microusd >= 0", name="chargeback_return_credit_bounds"),
+        CheckConstraint("status IN ('applied', 'pending_reconciliation')", name="chargeback_return_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    order_id: Mapped[str] = mapped_column(ForeignKey("payment_orders.id", ondelete="RESTRICT"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    chargeback_id: Mapped[str | None] = mapped_column(ForeignKey("payment_chargebacks.id", ondelete="RESTRICT"), nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(32))
+    provider_dispute_id: Mapped[str] = mapped_column(String(120))
+    provider_return_id: Mapped[str] = mapped_column(String(120))
+    payment_amount_minor: Mapped[int] = mapped_column(BigInteger)
+    payment_currency: Mapped[str] = mapped_column(String(3))
+    restored_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    canceled_risk_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    reversed_loss_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    risk_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class SafetyAudit(Base):
     __tablename__ = "safety_audits"
 

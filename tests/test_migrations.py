@@ -332,6 +332,17 @@ def test_upgrade_from_initial_to_production_hardening_on_sqlite(tmp_path):
         db.commit()
     with pytest.raises(RuntimeError, match="拒付记录必须保留"):
         command.downgrade(cfg, "0015_key_policy")
+    assert_schema_revision(engine, "0016_chargebacks")
+    command.upgrade(cfg, "head")
+    from app.models import PaymentChargebackReturn
+    with Session(engine) as db:
+        db.add(PaymentChargebackReturn(id="cb-return", order_id="cb-order", user_id="old-user",
+            chargeback_id="cb-record", provider="inert-test", provider_dispute_id="inert-dispute",
+            provider_return_id="inert-return", payment_amount_minor=1, payment_currency="USD",
+            status="pending_reconciliation"))
+        db.commit()
+    with pytest.raises(RuntimeError, match="拒付返还记录必须保留"):
+        command.downgrade(cfg, "0016_chargebacks")
     assert_schema_revision(engine, SCHEMA_HEAD)
 
 
