@@ -154,15 +154,24 @@ function cell(text, className = "") {
 async function loadReady() {
   state.ready = await api("/readyz", { auth: false });
   const byok = state.ready.gateway_mode === "byok";
+  const managed = state.ready.gateway_mode === "managed_gateway";
   byId("register-form").hidden = !state.ready.public_signup;
   byId("invitation-note").hidden = state.ready.public_signup;
   byId("provider-panel").hidden = !byok;
-  byId("model-test-panel").hidden = !byok;
+  byId("model-test-panel").hidden = !(byok || managed);
   document.querySelector(".panel-wallet").hidden = byok;
   document.querySelector(".panel-ledger").hidden = byok;
   if (byok) {
     byId("balance-label").textContent = "供应商累计支出";
     byId("balance-note").textContent = "按本页最近调用记录汇总；以供应商账单为准";
+  }
+  if (managed) {
+    byId("account-introduction").textContent = "购买本站调用额度，使用本站 Key 调用平台模型；不需要提供供应商 Key。";
+    byId("model-test-introduction").textContent = "确认本站余额与预算后，使用本站 Key 运行测试。测试会消耗调用额度。";
+    const catalog = await api("/public/catalog", {auth: false});
+    byId("test-model-select").replaceChildren(...catalog.models.map((model) => {
+      const option = document.createElement("option"); option.value = model.id; option.textContent = model.id; return option;
+    }));
   }
   const flags = [
     state.ready.public_signup ? "注册开启" : "注册关闭",
@@ -183,8 +192,8 @@ async function loadReady() {
     await loadTurnstile();
     renderCaptcha("register");
   }
-  byId("mode-value").textContent = byok ? "BYOK" : (state.ready.live_payments ? "正式桥接" : (state.ready.test_payments ? "受控测试" : "安全关闭"));
-  byId("provider-value").textContent = `${state.ready.providers} 个可用 Provider`;
+  byId("mode-value").textContent = managed ? "平台供给" : byok ? "BYOK" : (state.ready.live_payments ? "正式桥接" : (state.ready.test_payments ? "受控测试" : "安全关闭"));
+  byId("provider-value").textContent = managed ? "渠道实时可用性以实际任务结果为准" : `${state.ready.providers} 个可用 Provider`;
   if (state.ready.live_payments) {
     const data = await api("/billing/packages", { auth: false });
     const options = data.packages.map((item) => {
@@ -477,7 +486,7 @@ byId("checkout-form").addEventListener("submit", async (event) => {
     const order = await api("/billing/checkout", {
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },
-      body: { sku: data.sku, return_url: `${window.location.origin}/` },
+      body: { sku: data.sku, return_url: `${window.location.origin}/console` },
     });
     window.location.assign(order.checkout_url);
   } catch (error) { showToast(error.message); }

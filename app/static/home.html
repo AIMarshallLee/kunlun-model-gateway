@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Kunlun model gateway. One API key, prepaid usage and clear request accounting.">
+  <title>Kunlun — Model access, under control</title>
+  <link rel="stylesheet" href="/assets/site.css"><script src="/assets/site.js" defer></script>
+</head>
+<body data-page="home">
+  <a class="skip" href="#main" data-zh="跳到正文">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="/" data-local><span class="brand-mark">K</span>KUNLUN<span class="brand-sub">MODEL GATEWAY</span></a>
+    <nav aria-label="Main navigation"><a href="/#pricing" data-local data-zh="模型与价格">Models & pricing</a><a href="/api-guide" data-local data-zh="接入文档">API guide</a><a href="/console" data-local data-zh="控制台">Console ↗</a><button id="language" type="button" aria-label="Switch language">中文</button></nav>
+  </header>
+  <main id="main">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">ONE KEY / CLEAR ACCOUNTING</p>
+        <h1 data-zh="多模型接入，支出尽在掌握。">Model access.<br>Under control.</h1>
+        <p class="lead" data-zh="用一个本站 Key 接入已上架的文本模型。预付额度、设置预算、追踪每一次扣费。无需自带供应商 Key。">Access listed text models with one gateway key. Prepay for usage, set a budget and trace every charge. No supplier key required.</p>
+        <div class="hero-actions"><a class="button" href="/console" data-local data-zh="打开控制台 →">Open console →</a><a class="text-link" href="/api-guide" data-local data-zh="阅读接入文档">Read the API guide</a></div>
+        <p class="service-status" id="service-status" role="status" data-zh="正在读取服务配置…">Reading service configuration…</p>
+      </div>
+      <div class="request-card" aria-label="Illustrative request lifecycle">
+        <div class="card-top"><span>REQUEST / 001</span><span class="outline-label" data-zh="流程示意，非真实调用">ILLUSTRATION · NOT LIVE DATA</span></div>
+        <div class="terminal-line"><span class="verb">POST</span><code>/v1/chat/completions</code></div>
+        <ol class="request-flow">
+          <li><span class="step-number">01</span><div><strong data-zh="验证本站 Key">Verify gateway key</strong><small data-zh="只允许已验证的账户访问">Verified accounts only</small></div><span class="step-icon">↳</span></li>
+          <li><span class="step-number">02</span><div><strong data-zh="预留额度与预算">Reserve credit & budget</strong><small data-zh="额度不足时不向上游发送">No admission without sufficient funds</small></div><span class="step-icon">↳</span></li>
+          <li><span class="step-number">03</span><div><strong data-zh="调用已配置的模型">Call a configured model</strong><small data-zh="仅明确未处理的错误可安全切换">Safe failures only can switch routes</small></div><span class="step-icon">↳</span></li>
+          <li><span class="step-number">04</span><div><strong data-zh="结算，或保留占用等待对账">Settle, or hold for reconciliation</strong><small data-zh="未知用量不会被当成零费用">Unknown usage is not treated as free</small></div><span class="step-icon">□</span></li>
+        </ol>
+        <div class="card-foot"><span data-zh="只记元数据">METADATA ONLY</span><span data-zh="不保存提示词或回答">No prompt or response storage</span></div>
+      </div>
+    </section>
+
+    <section class="value-strip" aria-label="Gateway capabilities">
+      <div><span class="eyebrow">01 / CONNECT</span><h2 data-zh="接入已有工具">Fits your tools</h2><p data-zh="支持指定 OpenAI-compatible 接口与 OpenCode 接入，不声称兼容所有 API。">Selected OpenAI-compatible endpoints and OpenCode integration. Not a promise of universal API compatibility.</p></div>
+      <div><span class="eyebrow">02 / CONTROL</span><h2 data-zh="先有预算，再发请求">A budget before a request</h2><p data-zh="账户额度与硬预算分别生效。余额不足或预算耗尽时，停止新请求。">Account credit and hard budgets work separately. Insufficient credit or an exhausted budget stops new requests.</p></div>
+      <div><span class="eyebrow">03 / ACCOUNT</span><h2 data-zh="每次扣费都有依据">A record for every charge</h2><p data-zh="查看用量、扣费与原任务状态。内部重试不会让客户重复付费。">Inspect usage, charges and original request status. Internal attempts do not create duplicate customer charges.</p></div>
+    </section>
+
+    <section id="pricing" class="section pricing-section">
+      <div class="section-heading"><div><p class="eyebrow">MODEL CATALOG</p><h2 data-zh="看清价格，再开始调用。">Know the price.<br>Then make the call.</h2></div><p data-zh="展示数据库当前生效的零售价格。已受理请求使用当时冻结的价格版本。">Current retail prices from the active database catalog. Accepted requests retain their original price version.</p></div>
+      <p id="catalog-note" class="notice" role="status" data-zh="价格加载中；请勿根据示例价格购买额度。">Loading prices. Do not purchase credit based on example prices.</p>
+      <div class="table-scroll"><table><caption class="sr-only" data-zh="模型价格，单位为每百万 Token 美元">Model pricing in USD per million tokens</caption><thead><tr><th data-zh="模型">Model</th><th data-zh="输入 / 百万 Token">Input / 1M tokens</th><th data-zh="输出 / 百万 Token">Output / 1M tokens</th><th data-zh="输出上限">Output limit</th><th data-zh="价格版本">Version</th></tr></thead><tbody id="model-prices"></tbody></table></div>
+      <div class="catalog-footer"><span id="catalog-timestamp"></span><button type="button" id="refresh-catalog" class="secondary" data-zh="刷新价格">Refresh prices</button></div>
+      <p class="muted" data-zh="只支持已上架且计费维度经过验证的模型。显示价格不代表供应商实时可用，不承诺无限量或永不中断。">Only listed models with supported billing dimensions are offered. A listed price is not a live supplier health check. No unlimited-use or uninterrupted-service promise.</p>
+    </section>
+
+    <section class="section onboarding"><div><p class="eyebrow">FROM ACCOUNT TO API</p><h2 data-zh="一条清晰的接入路径。">A clear path<br>to your first request.</h2></div><ol><li><strong data-zh="注册并验证邮箱">Register and verify your email</strong><p data-zh="注册是否开放，以当前服务配置为准。">Registration availability follows the current service configuration.</p></li><li><strong data-zh="购买额度，创建本站 Key">Purchase credit, create a gateway key</strong><p data-zh="支付功能启用后，通过托管收银台购买；支付跳转本身不会增加余额。">When checkout is enabled, use the hosted payment page. A payment redirect alone never credits your account.</p></li><li><strong data-zh="配置模型、预算与幂等键">Configure your model, budget and idempotency key</strong><p data-zh="先做小额测试，再接入 OpenCode 或自有工具。">Start with a small test before connecting OpenCode or your own tool.</p></li></ol></section>
+    <section class="closing"><h2 data-zh="先读清边界，再放心接入。">Clear boundaries.<br>Before your first call.</h2><a class="button" href="/service-info" data-local data-zh="查看服务与数据说明 →">Service & data information →</a></section>
+  </main>
+  <footer class="site-footer"><span>KUNLUN / MODEL GATEWAY</span><div><a href="/api-guide" data-local data-zh="API 文档">API guide</a><a href="/service-info" data-local data-zh="服务与支持">Service & support</a><span data-zh="不出售共享订阅账号">No shared subscription accounts</span></div></footer>
+  <noscript>This page requires JavaScript for current prices and language switching. No prices are implied when the catalog cannot be loaded.</noscript>
+</body>
+</html>

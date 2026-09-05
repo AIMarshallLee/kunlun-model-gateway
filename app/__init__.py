@@ -30,6 +30,7 @@ from .auth import Principal, enforce_auth_rate_limit, require_api_key, require_o
 from .config import Settings
 from .customer_delivery import router as delivery_router, recorded_request_response
 from .managed_gateway import router as managed_router
+from .public_site import router as public_router
 from .services import request_limits
 from .services.platform_credentials import SupabasePlatformVault
 from .client_ip import TrustedProxyClientIPMiddleware
@@ -272,6 +273,7 @@ def create_app(
     )
     app.include_router(delivery_router)
     app.include_router(managed_router)
+    app.include_router(public_router)
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -412,6 +414,11 @@ def create_app(
         return response
 
     @app.get("/", include_in_schema=False)
+    def homepage() -> FileResponse:
+        page = "home.html" if settings.gateway_mode == "managed_gateway" else "index.html"
+        return FileResponse(static_dir / page, media_type="text/html")
+
+    @app.get("/console", include_in_schema=False)
     def developer_console() -> FileResponse:
         return FileResponse(static_dir / "index.html", media_type="text/html")
 

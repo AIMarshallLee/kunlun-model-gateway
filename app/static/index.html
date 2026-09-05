@@ -23,14 +23,14 @@
       <h1 id="page-title">每一次模型调用，<br><em>先有预算，再有结果。</em></h1>
       <div class="opening-note">
         <span>01</span>
-        <p>连接你自己的模型账号，设置支出上限，查看每次任务的成本与处理状态。</p>
+        <p id="account-introduction">连接模型服务，设置支出上限，查看每次任务的成本与处理状态。</p>
       </div>
     </section>
 
     <section class="auth-shell" id="auth-shell" aria-label="账户入口">
       <div class="auth-intro">
         <p class="kicker">进入控制面</p>
-        <h2>你的模型账号，<br>你的支出上限。</h2>
+        <h2>统一的模型入口，<br>清晰的支出上限。</h2>
         <p>会话只保存在当前页面内存中；刷新页面会自动退出。API Key 只显示一次。</p>
       </div>
       <div class="auth-forms">
@@ -166,7 +166,7 @@
         </article>
 
         <article class="panel" id="model-test-panel" hidden>
-          <div class="panel-title"><div><span>04</span><h3>首次调用验收</h3></div><p>先连接模型并设置预算，再生成网关 Key。此操作会使用你的模型预算。</p></div>
+          <div class="panel-title"><div><span>04</span><h3>首次调用验收</h3></div><p id="model-test-introduction">先配置模型与预算，再生成网关 Key。此操作可能产生费用。</p></div>
           <form id="model-test-form" class="inline-form">
             <label>网关 Key<input name="gateway_key" type="password" autocomplete="off" required></label>
             <label>模型<select name="model" id="test-model-select" required></select></label>
