@@ -5,6 +5,7 @@ const client = createOpsClient();
 let language = "en", identity = null, active = null, offset = 0, selected = null, actions = [], command = null;
 let epoch = 0, expiryTimer = null, executing = false;
 let returnOrderFilter = "";
+let commandSecret = "", channelQueryEpoch = 0;
 const modules = [
   {id: "alerts", scope: "alerts:read", en: "Operational alerts", zh: "运营告警", path: "/ops/alerts", detail: "/ops/alerts/", field: "items"},
   {id: "notifications", scope: "alerts:read", en: "Notification records", zh: "通知投递记录", path: "/ops/notifications", field: "items"},
@@ -14,7 +15,7 @@ const modules = [
   {id: "returns", scope: "payments:read", en: "Chargeback returns", zh: "拒付资金返还", path: "/ops/chargeback-returns", detail: "/ops/chargeback-returns/", field: "items"},
   {id: "requests", scope: "reconciliation:read", en: "Model reconciliation", zh: "模型对账", path: "/ops/reconciliation", detail: "/ops/requests/", field: "requests"},
   {id: "models", scope: "models:read", en: "Models & retail prices", zh: "模型与售价", path: "/ops/models", detail: "/ops/models/", field: "items"},
-  {id: "channels", scope: "channels:read", en: "Supply status", zh: "渠道状态", path: "/ops/channels", field: "channels"},
+  {id: "channels", scope: "channels:read", en: "Supply status", zh: "渠道状态", path: "/ops/channels", detail: "/ops/channels/", field: "catalog"},
   {id: "budget", scope: "metrics:read", en: "Platform budget", zh: "平台预算", path: "/ops/platform-budget"},
   {id: "audit", scope: "audit:read", en: "Audit trail", zh: "操作审计", path: "/ops/audit", field: "items"},
 ];
@@ -47,8 +48,9 @@ function setActionBusy(value) {
   executing = value;
   document.querySelectorAll("#action-form input, #action-form textarea, #action-form select, #action-form button").forEach((element) => { element.disabled = value; });
   byId("cancel").disabled = value;
+  byId("channel-operation-lookup").querySelectorAll("input,button").forEach((element) => { element.disabled = value; });
 }
-function cancelCommand() { command = null; byId("confirmation").hidden = true; byId("command-preview").textContent = ""; }
+function cancelCommand() { command = null; commandSecret = ""; byId("confirmation").hidden = true; byId("command-preview").textContent = ""; }
 function clearSelection() {
   selected = null; actions = []; cancelCommand();
   byId("snapshot").textContent = ""; byId("result").textContent = "";
@@ -57,12 +59,15 @@ function clearSelection() {
   byId("chargeback-context").hidden = true; byId("chargeback-state").textContent = "";
   byId("return-context").hidden = true; byId("return-state").textContent = "";
   byId("financial-links").replaceChildren();
+  byId("channel-context").hidden = true; byId("channel-state").textContent = "";
+  channelQueryEpoch += 1; byId("channel-operation-result").textContent = "";
   byId("action-form").hidden = true; byId("action-form").reset(); byId("object-id").value = "";
 }
 function lock() {
   client.logout(); identity = null; active = null; epoch += 1; setActionBusy(false); clearTimeout(expiryTimer);
   clearSelection(); byId("records").replaceChildren(); byId("modules").replaceChildren();
   returnOrderFilter = ""; byId("return-order-id").value = ""; byId("return-filter").hidden = true;
+  byId("channel-operation-id").value = ""; byId("channel-operation-lookup").hidden = true;
   byId("identity").textContent = ""; byId("environment").textContent = ""; byId("operator-token").value = "";
   byId("desk").hidden = true; byId("access").hidden = false;
 }
@@ -89,12 +94,26 @@ function renderChrome() {
 }
 function renderFacts() {
   if (!selected) return;
-  const {data, kind} = selected, row = data.account || data.order || data.request || data.model || data.alert || data.chargeback || data.return;
+  const {data, kind} = selected, row = data.account || data.order || data.request || data.model || data.alert || data.chargeback || data.return || data.channel;
   const facts = [[say("Object ID", "对象 ID"), row.id], [say("Status", "状态"), kind === "models" ? (row.active ? say("Listed", "已上架") : say("Unlisted", "已下架")) : row.status]];
   byId("alert-context").hidden = kind !== "alerts";
   byId("chargeback-context").hidden = kind !== "chargebacks";
   byId("return-context").hidden = kind !== "returns";
-  byId("general-action-context").hidden = ["chargebacks", "returns"].includes(kind);
+  byId("channel-context").hidden = kind !== "channels";
+  byId("general-action-context").hidden = ["chargebacks", "returns", "channels"].includes(kind);
+  if (kind === "channels") {
+    facts[0][1] = row.provider;
+    facts[1][1] = ({enabled: say("Enabled credential — health unverified", "凭据已启用 — 健康未验证"),
+      disabled: say("Disabled", "已禁用"), unconfigured: say("Not configured", "尚未配置"),
+      pending_cleanup: say("Disabled — Vault cleanup pending", "已禁用 — Vault 清理待处理")})[row.status] || row.status;
+    facts.push([say("Credential version", "凭据版本"), Number.isSafeInteger(row.version) ? row.version : say("Verify exact version", "请核对精确版本")],
+      [say("Channel ID", "渠道 ID"), row.id || "—"], [say("Configured priority", "配置优先级"), row.priority],
+      [say("Allowed upstream host", "允许的上游主机"), row.upstream_host],
+      [say("Configured models", "配置模型"), row.models.join(", ")]);
+    byId("channel-state").textContent = row.pending_cleanup
+      ? say("Credential use is disabled, but Vault cleanup is incomplete. Inspect the original operation before an explicitly approved cleanup attempt. Do not provision another key here yet.", "凭据已停止使用，但 Vault 清理未完成。先查原操作，再执行另行批准的清理；此状态暂不配置新密钥。")
+      : say("Configuration is not a health probe or supplier approval. Priority and models come from the server allowlist. A submitted version is a snapshot, not a version lock; coordinate concurrent operators and inspect current state after every change.", "配置不代表健康探测或供应商批准。优先级和模型来自服务端允许目录。所见版本是快照，不是版本锁；请协调并行运维，每次变更后核查当前状态。");
+  }
   const links = [];
   const related = (en, zh, destination, objectId = null, orderFilter = "") => {
     if (!modules.some((item) => item.id === destination && has(item.scope))) return;
@@ -179,6 +198,8 @@ async function load() {
   const current = ++epoch; clearSelection(); notice(""); renderChrome();
   byId("return-filter").hidden = active.id !== "returns";
   byId("return-order-id").value = returnOrderFilter;
+  byId("channel-operation-lookup").hidden = active.id !== "channels";
+  if (active.id !== "channels") byId("channel-operation-id").value = "";
   byId("records").replaceChildren(); byId("lookup").hidden = !active.detail;
   byId("next").disabled = true; byId("previous").disabled = true; byId("page").textContent = "";
   try {
@@ -198,14 +219,18 @@ async function load() {
       const button = document.createElement("button"); button.className = "record"; button.type = "button";
       const title = document.createElement("strong"), summary = document.createElement("small");
       title.textContent = row.email || row.model || row.id || row.request_id || row.provider || row.period || active[language];
+      if (active.id === "channels") title.textContent = row.provider;
       summary.textContent = [row.status, row.action, row.model, row.created_at].filter(Boolean).join(" · ");
+      if (active.id === "channels") {
+        button.dataset.channelProvider = row.provider; summary.textContent = `${row.status} · v${row.version}`;
+      }
       if (active.id === "alerts") {
         title.textContent = alertTitle(row.id); title.dataset.alertId = row.id;
         summary.textContent = `${row.severity} · ${row.count}`;
         button.dataset.severity = row.severity;
       }
       button.append(title, summary);
-      button.addEventListener("click", () => active.detail ? inspect(row.id || row.request_id) : showJSON("snapshot", row));
+      button.addEventListener("click", () => active.detail ? inspect(active.id === "channels" ? row.provider : row.id || row.request_id) : showJSON("snapshot", row));
       return button;
     }));
     return true;
@@ -226,6 +251,10 @@ async function inspect(id) {
     if (current !== epoch) return;
     const data = active.id === "chargebacks" ? {chargeback: response} : active.id === "returns" ? {return: response} : response;
     selected = {id, kind: active.id, data}; showJSON("snapshot", data); renderFacts(); renderActions();
+    if (selected.kind === "channels") {
+      const card = [...byId("records").children].find((element) => element.dataset.channelProvider === data.channel.provider);
+      if (card) card.querySelector("small").textContent = `${data.channel.status} · v${data.channel.version}`;
+    }
     if (selected.kind === "models") {
       byId("retail-input").value = data.model.input_microusd_per_million;
       byId("retail-output").value = data.model.output_microusd_per_million;
@@ -237,6 +266,17 @@ function buildActions() {
   if (!selected) return [];
   const {data, id, kind} = selected, list = [];
   const add = (en, zh, path, body, target, state, settle = false, price = false) => list.push({en, zh, path, body, target, state, settle, price});
+  if (kind === "channels" && has("channels:write")) {
+    const row = data.channel, state = `${row.status}:v${row.version}`;
+    if (!row.pending_cleanup) {
+      add(row.active ? "Rotate platform key" : "Configure platform key", row.active ? "轮换平台密钥" : "配置平台密钥",
+        `/ops/channels/${encodeURIComponent(row.provider)}`, {operation_id: crypto.randomUUID()}, row.provider, state);
+      list.at(-1).needsSecret = true;
+    }
+    if (row.active || row.pending_cleanup) add(row.pending_cleanup ? "Retry approved Vault cleanup" : "Disable platform credential",
+      row.pending_cleanup ? "重试已批准的 Vault 清理" : "禁用平台凭据", `/ops/channels/${encodeURIComponent(row.provider)}/revoke`,
+      {operation_id: crypto.randomUUID()}, row.provider, state);
+  }
   if (kind === "alerts" && has("alerts:write")) add("Acknowledge observation (not resolve)", "确认已知悉（不解除告警）",
     `/ops/alerts/${encodeURIComponent(id)}/ack`, {expected_revision: data.alert.revision, operation_id: crypto.randomUUID()}, id, data.alert.revision);
   if (kind === "models" && has("models:write")) {
@@ -300,6 +340,8 @@ function renderActions() {
   byId("price-fields").hidden = !actions[Number(byId("action").value)]?.price;
   // Hidden price fields must not block an unlist command via native validation.
   byId("price-fields").querySelectorAll("input").forEach((element) => { element.disabled = executing || byId("price-fields").hidden; });
+  byId("channel-secret-field").hidden = !actions[Number(byId("action").value)]?.needsSecret;
+  byId("channel-secret").disabled = executing || byId("channel-secret-field").hidden;
 }
 byId("operator-login").addEventListener("submit", async (event) => {
   event.preventDefault(); const raw = byId("operator-token").value.trim(); byId("operator-token").value = "";
@@ -331,14 +373,24 @@ byId("return-filter-clear").addEventListener("click", () => {
   if (executing || active?.id !== "returns") return;
   returnOrderFilter = ""; offset = 0; load();
 });
+byId("channel-operation-lookup").addEventListener("submit", async (event) => {
+  event.preventDefault(); if (executing || active?.id !== "channels") return;
+  const operationId = byId("channel-operation-id").value.trim(), current = epoch, queryEpoch = ++channelQueryEpoch;
+  byId("channel-operation-result").textContent = "";
+  try {
+    const result = await client.request(`/ops/channel-operations/${encodeURIComponent(operationId)}`);
+    if (current === epoch && queryEpoch === channelQueryEpoch) showJSON("channel-operation-result", result);
+  } catch (error) { if (current === epoch && queryEpoch === channelQueryEpoch) errorNotice(error); }
+});
 byId("refresh").addEventListener("click", load);
 byId("previous").addEventListener("click", () => { offset = Math.max(0, offset - 20); load(); });
 byId("next").addEventListener("click", () => { offset += 20; load(); });
 byId("lookup").addEventListener("submit", (event) => { event.preventDefault(); inspect(byId("object-id").value.trim()); });
-byId("action").addEventListener("change", () => { cancelCommand(); renderActions(); });
+byId("action").addEventListener("change", () => { cancelCommand(); byId("channel-secret").value = ""; renderActions(); });
 byId("reason").addEventListener("input", cancelCommand);
 byId("usage-fields").addEventListener("input", cancelCommand);
 byId("price-fields").addEventListener("input", cancelCommand);
+byId("channel-secret").addEventListener("input", cancelCommand);
 byId("action-form").addEventListener("submit", (event) => {
   event.preventDefault(); if (executing) return;
   const action = actions[Number(byId("action").value)]; if (!action) return;
@@ -358,22 +410,34 @@ byId("action-form").addEventListener("submit", (event) => {
     }
   }
   command = {path: action.path, body, target: action.target, observed_state: action.state};
+  if (action.needsSecret) {
+    commandSecret = byId("channel-secret").value; byId("channel-secret").value = "";
+    if (!commandSecret.trim()) { cancelCommand(); notice(say("Enter the approved platform key again.", "请重新输入已批准的平台密钥。")); return; }
+    command.method = "PUT"; command.credential = say("Supplied separately; never displayed", "单独提供；不予展示");
+  }
   if (selected?.kind === "chargebacks") command.observed_financials = {payment_currency: selected.data.chargeback.payment_currency,
     source_order_id: selected.data.chargeback.order_id, ...Object.fromEntries(chargebackAmounts.map((key) => [key, selected.data.chargeback[key]]))};
   showJSON("command-preview", command); byId("confirmation").hidden = false; byId("confirm").disabled = false;
 });
-byId("cancel").addEventListener("click", cancelCommand);
+byId("cancel").addEventListener("click", () => { cancelCommand(); byId("channel-secret").value = ""; });
 byId("confirm").addEventListener("click", async () => {
   if (!command || executing) return;
   const current = epoch, frozenCommand = command;
+  let secretForSend = commandSecret; commandSecret = "";
+  if (selected?.kind === "channels") {
+    byId("channel-operation-id").value = frozenCommand.body.operation_id;
+    channelQueryEpoch += 1; byId("channel-operation-result").textContent = "";
+  }
   setActionBusy(true); byId("confirm").disabled = true; renderChrome();
   try {
-    const result = await client.request(frozenCommand.path, {method: "POST", body: frozenCommand.body});
+    const result = await client.request(frozenCommand.path, {method: frozenCommand.method || "POST",
+      body: frozenCommand.method === "PUT" ? {...frozenCommand.body, secret: secretForSend} : frozenCommand.body});
     if (current !== epoch) return;
     showJSON("result", {command: frozenCommand, result});
     notice(say("Response recorded. Refresh the object before another action.", "已记录响应。下次操作前请刷新对象核查。"));
   } catch (error) { if (current === epoch) errorNotice(error); }
   finally {
+    secretForSend = "";
     if (current === epoch) {
       setActionBusy(false); command = null; actions = []; byId("action-form").hidden = true;
       byId("confirm").disabled = true; byId("refresh").disabled = false;
@@ -382,6 +446,7 @@ byId("confirm").addEventListener("click", async () => {
       byId("alert-context").hidden = true;
       byId("chargeback-context").hidden = true;
       byId("return-context").hidden = true; byId("financial-links").replaceChildren();
+      byId("channel-context").hidden = true; byId("channel-secret").value = "";
       selected = null; renderChrome();
     }
   }

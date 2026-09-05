@@ -29,6 +29,9 @@ if __name__ == "__main__":
         client, auth, *_ = context
         app = client.app
         _, model_headers, payload = ready_call(context)
+        if "--channels" in sys.argv:
+            # Fixed synthetic catalog entry; no supplier connection or real key.
+            app.state.settings.providers.append({**app.state.settings.providers[0], "name": "backup"})
         app.state.test_upstream = lambda request: httpx.Response(500, json={"error": "synthetic uncertain cost"})
         for operation in ("ops-release-case", "ops-settle-case"):
             model_headers["Idempotency-Key"] = operation
@@ -120,12 +123,20 @@ if __name__ == "__main__":
                 scopes |= {"alerts:write", "accounts:write", "payments:write", "reconciliation:write", "payments:risk:write", "models:write"}
             if profile == "limited":
                 scopes = {"console:read", "alerts:read"}
+            if profile in {"channel_read", "channel_write"}:
+                scopes = {"console:read", "channels:read"}
+                if profile == "channel_write":
+                    scopes.add("channels:write")
             return {"token": mint_operator_token(OPS, subject="synthetic-operator", scopes=scopes, ttl_seconds=300),
                     "requests": requests, "order_id": bridge.webhook.order_id, "chargebacks": chargebacks, "returns": returns}
 
         @app.get("/__fixture__/refund-calls")
         def refund_calls():
             return {"count": len(bridge.refund_calls)}
+
+        @app.get("/__fixture__/channel-observation")
+        def channel_observation():
+            return {"model_calls": len(context[-1]), "operations": len(app.state.platform_vault._operations)}
 
         try:
             uvicorn.run(app, host="127.0.0.1", port=8797, access_log=False, log_level="warning")

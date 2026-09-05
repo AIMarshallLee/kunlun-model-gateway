@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import Field, SecretStr
 from sqlalchemy import select, func
+from urllib.parse import urlsplit
 
 from .auth import require_operator_scope
 from .schemas import StrictModel
@@ -36,7 +37,32 @@ def channels(request: Request, _operator=Depends(require_operator_scope("channel
         data = channel_vault(request).list()
     except SecretUnavailable:
         raise HTTPException(503, "平台密钥服务不可用") from None
-    return JSONResponse({"channels": data}, headers={"Cache-Control": "no-store"})
+    return JSONResponse({"channels": data, "catalog": channel_catalog(request, data)}, headers={"Cache-Control": "no-store"})
+
+
+def channel_catalog(request, stored):
+    indexed = {row["provider"]: row for row in stored}
+    result = []
+    for priority, provider in enumerate(request.app.state.settings.providers, 1):
+        row = indexed.get(provider["name"], {})
+        active, cleanup = bool(row.get("active")), bool(row.get("pending_cleanup"))
+        result.append({"id": row.get("id"), "provider": provider["name"], "version": row.get("version", 0),
+            "active": active, "pending_cleanup": cleanup,
+            "status": "pending_cleanup" if cleanup else "enabled" if active else "disabled" if row else "unconfigured",
+            "priority": priority, "models": provider["models"], "upstream_host": urlsplit(provider["base_url"]).hostname})
+    return result
+
+
+@router.get("/ops/channels/{provider}")
+def channel_detail(provider: str, request: Request, _operator=Depends(require_operator_scope("channels:read"))):
+    vault = channel_vault(request)
+    if provider not in {item["name"] for item in request.app.state.settings.providers}:
+        raise HTTPException(404, "渠道不在允许目录")
+    try:
+        row = next(item for item in channel_catalog(request, vault.list()) if item["provider"] == provider)
+    except SecretUnavailable:
+        raise HTTPException(503, "平台密钥服务不可用") from None
+    return JSONResponse({"channel": row}, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/ops/channel-operations/{operation_id}")

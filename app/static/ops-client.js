@@ -24,7 +24,7 @@ export function createOpsClient({fetcher = fetch, now = Date.now} = {}) {
     } catch (error) {
       if (version !== generation) throw new Error("Operator session changed / HTTP 401");
       if (error instanceof TypeError || error.name === "AbortError") {
-        throw new Error(options.method === "POST" ? "Operation result unknown; do not repeat. Read the original object and audit." : "Read failed; refresh to query again.");
+        throw new Error(options.method && options.method !== "GET" ? "Operation result unknown; do not repeat. Read the original object and audit." : "Read failed; refresh to query again.");
       }
       throw error;
     } finally { clearTimeout(timer); }
@@ -39,7 +39,7 @@ export function createOpsClient({fetcher = fetch, now = Date.now} = {}) {
   }
   async function request(path, options = {}) {
     if (!token || expires <= now()) { logout(); throw new Error("Operator session expired"); }
-    const write = options.method === "POST";
+    const write = options.method && options.method !== "GET";
     if (write && writing) throw new Error("Operator action busy");
     if (write) writing = true;
     const version = generation;

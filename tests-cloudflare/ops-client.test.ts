@@ -3,6 +3,18 @@ import {describe, expect, it, vi} from "vitest";
 import {createOpsClient} from "../app/static/ops-client.js";
 
 describe("operator transport", () => {
+  it("treats channel PUT as an exclusive mutation with unknown outcome on disconnect", async () => {
+    let fail: (error: Error) => void = () => {};
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({expires_at: 300, scopes: []})))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => {fail = reject;}));
+    const client = createOpsClient({fetcher, now: () => 100000});
+    await client.login("inert");
+    const pending = client.request("/ops/channels/openai", {method: "PUT", body: {secret: "test-only", operation_id: "op-1"}});
+    await expect(client.request("/ops/channels/openai/revoke", {method: "POST", body: {operation_id: "op-2"}})).rejects.toThrow("busy");
+    fail(new TypeError("disconnected"));
+    await expect(pending).rejects.toThrow("unknown");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
   it("keeps credentials on same-origin ops paths and does not expose them", async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({expires_at: 300, scopes: ["console:read"]})));
     const client = createOpsClient({fetcher, now: () => 100000});
