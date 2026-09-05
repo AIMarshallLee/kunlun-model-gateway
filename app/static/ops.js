@@ -5,6 +5,7 @@ const client = createOpsClient();
 let language = "en", identity = null, active = null, offset = 0, selected = null, actions = [], command = null;
 let epoch = 0, expiryTimer = null, executing = false;
 const modules = [
+  {id: "alerts", scope: "alerts:read", en: "Operational alerts", zh: "运营告警", path: "/ops/alerts", detail: "/ops/alerts/", field: "items"},
   {id: "accounts", scope: "accounts:read", en: "Accounts & keys", zh: "客户与 Key", path: "/ops/accounts", detail: "/ops/accounts/", field: "items"},
   {id: "orders", scope: "payments:read", en: "Orders & refunds", zh: "订单与退款", path: "/ops/orders", detail: "/ops/orders/", field: "items"},
   {id: "requests", scope: "reconciliation:read", en: "Model reconciliation", zh: "模型对账", path: "/ops/reconciliation", detail: "/ops/requests/", field: "requests"},
@@ -13,6 +14,19 @@ const modules = [
   {id: "budget", scope: "metrics:read", en: "Platform budget", zh: "平台预算", path: "/ops/platform-budget"},
   {id: "audit", scope: "audit:read", en: "Audit trail", zh: "操作审计", path: "/ops/audit", field: "items"},
 ];
+const alertLabels = {
+  model_reconciliation: ["Model costs need reconciliation", "模型成本待对账"],
+  stale_reservations: ["Reservation lease expired", "预授权占用已超时"],
+  payment_reconciliation: ["Payment outcome needs verification", "支付结果待核验"],
+  refund_reconciliation: ["Refund outcome needs verification", "退款结果待核验"],
+  payment_risk: ["Payment risk notes need review", "订单风险标记待核查"],
+  refund_risk: ["Refund credit shortfall", "退款额度不足风险"],
+  platform_budget: ["Platform cost budget threshold", "平台成本预算触阈"],
+  supply_observation_failed: ["Supply state could not be read", "供给状态无法读取"],
+  supply_unavailable: ["Listed models have no active supply", "已上架模型缺少启用供给"],
+  price_below_supply: ["Retail price is below configured cost", "售价低于配置成本"],
+};
+const alertTitle = (id) => alertLabels[id]?.[language === "en" ? 0 : 1] || id;
 const say = (en, zh) => language === "en" ? en : zh;
 const has = (scope) => identity?.scopes.includes(scope);
 const notice = (text) => { byId("notice").textContent = text; };
@@ -27,6 +41,7 @@ function clearSelection() {
   selected = null; actions = []; cancelCommand();
   byId("snapshot").textContent = ""; byId("result").textContent = "";
   byId("object-facts").replaceChildren();
+  byId("alert-context").hidden = true;
   byId("action-form").hidden = true; byId("action-form").reset(); byId("object-id").value = "";
 }
 function lock() {
@@ -58,8 +73,15 @@ function renderChrome() {
 }
 function renderFacts() {
   if (!selected) return;
-  const {data, kind} = selected, row = data.account || data.order || data.request || data.model;
+  const {data, kind} = selected, row = data.account || data.order || data.request || data.model || data.alert;
   const facts = [[say("Object ID", "对象 ID"), row.id], [say("Status", "状态"), kind === "models" ? (row.active ? say("Listed", "已上架") : say("Unlisted", "已下架")) : row.status]];
+  byId("alert-context").hidden = kind !== "alerts";
+  if (kind === "alerts") {
+    facts.push([say("Condition", "告警条件"), alertTitle(row.id)], [say("Severity", "级别"), row.severity],
+      [say("Affected count", "涉及数量"), row.count], [say("Observed at", "观察时间"), data.observed_at],
+      [say("Matching aggregate receipt", "相同汇总的确认记录"), row.acknowledgement ? `${row.acknowledgement.actor} · ${row.acknowledgement.at}` : say("None", "无")]);
+    byId("alert-destination").disabled = !modules.some((item) => item.id === row.destination && has(item.scope)) || executing;
+  }
   if (kind === "models") facts.push(
     [say("Model", "模型"), row.model], [say("Price version", "售价版本"), `v${row.version}`],
     [say("Input / 1M tokens", "输入 / 百万 Token"), `${row.input_microusd_per_million} microUSD`],
@@ -103,12 +125,17 @@ async function load() {
     byId("page").textContent = `${offset}–${offset + rows.length} / ${total}`;
     byId("previous").disabled = !paginated || offset === 0;
     byId("next").disabled = !paginated || offset + 20 >= total;
-    if (!rows.length) notice(say("No records in this view.", "此视图暂无记录。"));
+    if (!rows.length) notice(active.id === "alerts" ? say("No active conditions in evaluated rules. This is not readiness or notification-delivery proof.", "已评估规则暂无告警；这不证明生产就绪或通知送达。") : say("No records in this view.", "此视图暂无记录。"));
     byId("records").replaceChildren(...rows.map((row) => {
       const button = document.createElement("button"); button.className = "record"; button.type = "button";
       const title = document.createElement("strong"), summary = document.createElement("small");
       title.textContent = row.email || row.model || row.id || row.request_id || row.provider || row.period || active[language];
       summary.textContent = [row.status, row.action, row.model, row.created_at].filter(Boolean).join(" · ");
+      if (active.id === "alerts") {
+        title.textContent = alertTitle(row.id); title.dataset.alertId = row.id;
+        summary.textContent = `${row.severity} · ${row.count}`;
+        button.dataset.severity = row.severity;
+      }
       button.append(title, summary);
       button.addEventListener("click", () => active.detail ? inspect(row.id || row.request_id) : showJSON("snapshot", row));
       return button;
@@ -133,6 +160,8 @@ function buildActions() {
   if (!selected) return [];
   const {data, id, kind} = selected, list = [];
   const add = (en, zh, path, body, target, state, settle = false, price = false) => list.push({en, zh, path, body, target, state, settle, price});
+  if (kind === "alerts" && has("alerts:write")) add("Acknowledge observation (not resolve)", "确认已知悉（不解除告警）",
+    `/ops/alerts/${encodeURIComponent(id)}/ack`, {expected_revision: data.alert.revision, operation_id: crypto.randomUUID()}, id, data.alert.revision);
   if (kind === "models" && has("models:write")) {
     const row = data.model, path = `/ops/models/${encodeURIComponent(id)}/price`;
     const state = `${row.active ? "listed" : "unlisted"}:v${row.version}`;
@@ -181,7 +210,7 @@ function renderActions() {
   byId("action").replaceChildren(...actions.map((action, index) => {
     const option = document.createElement("option"); option.value = String(index); option.textContent = action[language]; return option;
   }));
-  if (actions[Number(previous)]) byId("action").value = previous;
+  if (previous !== "" && actions[Number(previous)]) byId("action").value = previous;
   byId("action-form").hidden = !actions.length;
   byId("usage-fields").hidden = !actions[Number(byId("action").value)]?.settle;
   byId("price-fields").hidden = !actions[Number(byId("action").value)]?.price;
@@ -201,7 +230,15 @@ byId("operator-login").addEventListener("submit", async (event) => {
   finally { button.disabled = false; }
 });
 byId("logout").addEventListener("click", () => { lock(); notice(say("Desk locked. The issued token remains valid until its expiry.", "工作台已锁定；已签发凭证仍有效至到期时间。")); });
-byId("language").addEventListener("click", () => { language = language === "en" ? "zh" : "en"; renderChrome(); });
+byId("language").addEventListener("click", () => {
+  language = language === "en" ? "zh" : "en"; renderChrome();
+  document.querySelectorAll("[data-alert-id]").forEach((element) => { element.textContent = alertTitle(element.dataset.alertId); });
+});
+byId("alert-destination").addEventListener("click", () => {
+  if (executing || !selected?.data.alert) return;
+  const destination = modules.find((item) => item.id === selected.data.alert.destination && has(item.scope));
+  if (destination) { active = destination; offset = 0; load(); }
+});
 byId("refresh").addEventListener("click", load);
 byId("previous").addEventListener("click", () => { offset = Math.max(0, offset - 20); load(); });
 byId("next").addEventListener("click", () => { offset += 20; load(); });
@@ -248,6 +285,7 @@ byId("confirm").addEventListener("click", async () => {
       byId("confirm").disabled = true; byId("refresh").disabled = false;
       // Keep the submitted command/reference visible, including after timeout.
       byId("object-facts").replaceChildren(); byId("snapshot").textContent = "";
+      byId("alert-context").hidden = true;
       selected = null; renderChrome();
     }
   }

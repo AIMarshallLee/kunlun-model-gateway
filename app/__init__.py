@@ -374,6 +374,8 @@ def create_app(
     app.include_router(ops_console_router)
     from .model_catalog import router as model_catalog_router
     app.include_router(model_catalog_router)
+    from .ops_alerts import router as ops_alerts_router
+    app.include_router(ops_alerts_router)
     app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
     app.add_middleware(RequestBodyLimitMiddleware)
     if settings.captcha_required and settings.captcha_provider == "turnstile":

@@ -12,6 +12,8 @@ import time
 
 
 ALLOWED_SCOPES = {
+    "alerts:read",
+    "alerts:write",
     "models:read",
     "models:write",
     "console:read",

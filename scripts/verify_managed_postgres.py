@@ -178,7 +178,37 @@ def main():
         assert [row.version for row in versions] == [1, 2, 3]
         assert not any(row.active for row in versions)
         assert versions[0].input_microusd_per_million == 1000000
+    # Alert receipts use the existing append-only audit, with no balance or
+    # incident writes. Duplicate concurrent confirmations insert only once.
+    from app.ops_alerts import AlertReceipt, acknowledge, collect_alerts
+    alert_settings = request_context.app.state.settings
+    alert_settings.model_reservation_lease_seconds = 300
+    alert_settings.platform_daily_budget_microusd = 3
+    request_context.app.state.platform_vault = SimpleNamespace(list=lambda: [])
+    alert_claims = OperatorClaims("ci-alert-operator", frozenset({"alerts:write"}), 0, 1, "ci-inert-alert-token")
+    with Session(engine) as db:
+        observation = next(row for row in collect_alerts(db, alert_settings, request_context.app.state.platform_vault)["items"]
+                           if row["id"] == "platform_budget")
+        wallets_before = [(db.get(Wallet, uid).balance_microusd, db.get(Wallet, uid).reserved_microusd) for uid, _ in principals]
+    receipt = AlertReceipt(expected_revision=observation["revision"], operation_id=f"{run}:alert",
+                           reason="isolated concurrent alert receipt acceptance")
+    ready = Barrier(2)
+    def confirm_alert(_):
+        ready.wait(timeout=10)
+        try:
+            acknowledge("platform_budget", receipt, request_context, alert_claims)
+            return 201
+        except HTTPException as error:
+            return error.status_code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(confirm_alert, range(2))) == [201, 409]
+    with Session(engine) as db:
+        assert db.scalar(select(func.count()).select_from(OperatorAction).where(OperatorAction.operation_id == receipt.operation_id)) == 1
+        assert wallets_before == [(db.get(Wallet, uid).balance_microusd, db.get(Wallet, uid).reserved_microusd) for uid, _ in principals]
+        assert next(row for row in collect_alerts(db, alert_settings, request_context.app.state.platform_vault)["items"]
+                    if row["id"] == "platform_budget")["status"] == "attention"
     engine.dispose()
+    print("Alert PostgreSQL race passed: duplicate receipt -> one immutable audit; wallets unchanged; condition remains active.")
     print("Price PostgreSQL races passed: competing v1 commands -> 201/409; historical settlement unchanged; no new admission after unlisting.")
     print("Key freeze PostgreSQL race passed: no new admission after freeze; existing holds can finalize.")
     print("Key PostgreSQL concurrency passed: 16 distinct requests on one capped key -> 1 hold; release restored capacity.")

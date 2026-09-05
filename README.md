@@ -53,6 +53,8 @@ Key 创建支持可选模型范围、单次输出上限和累计消费上限；�
 
 商业模式已有模型售价版本、上下架与历史查询；调价不重算旧请求，重启不覆盖运营目录。接口、权限、并发锁及回滚限制见 [模型售价验收](docs/MODEL-PRICE-ACCEPTANCE.md)。
 
+运营台可聚合预算、供给、售价、模型与支付异常，并记录“已知悉”；确认不会解除告警或释放资金。覆盖范围、权限及尚未接通的外部通知见 [运营告警验收](docs/OPS-ALERTS-ACCEPTANCE.md)。
+
 ## OpenCode / OpenAI-compatible 接入
 
 把网关作为 OpenAI-compatible provider，核心配置是：
