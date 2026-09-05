@@ -5,18 +5,32 @@ import hashlib
 import json
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .auth import require_operator_scope
-from .models import ModelPrice, ModelRequest, OperatorAction, PaymentOrder, PaymentRefund, PlatformDailyBudget
+from .models import ModelPrice, ModelRequest, OperatorAction, OutboxEvent, PaymentOrder, PaymentRefund, PlatformDailyBudget
 from .schemas import StrictModel
 from .security import as_utc, token_digest, utcnow
 from .services.credentials import SecretUnavailable
 
 router = APIRouter()
+
+
+@router.get("/ops/notifications")
+def notifications(request: Request, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0, le=1_000_000),
+                  _operator=Depends(require_operator_scope("alerts:read"))):
+    from .services.alert_notifications import TOPIC, delivery_projection
+    if request.app.state.settings.gateway_mode != "managed_gateway":
+        raise HTTPException(404, "Not Found")
+    with request.app.state.SessionLocal() as db:
+        query = select(OutboxEvent).where(OutboxEvent.topic == TOPIC)
+        total = db.scalar(select(func.count()).select_from(query.subquery()))
+        rows = db.scalars(query.order_by(OutboxEvent.created_at.desc(), OutboxEvent.id).offset(offset).limit(limit))
+        return {"items": [delivery_projection(row) for row in rows], "pagination": {"limit": limit, "offset": offset, "total": total},
+                "note": "accepted means SMTP accepted, not inbox delivery; unconfirmed may already have been sent."}
 
 
 def collect_alerts(db, settings, vault, *, now=None):

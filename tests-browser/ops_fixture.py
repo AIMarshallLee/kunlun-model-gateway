@@ -15,6 +15,8 @@ from checkout_fixture import BrowserPaymentBridge
 from test_managed_gateway import OPS, managed, ready_call
 from app.models import ModelRequest
 from app.services.ops_tokens import mint_operator_token
+from app.ops_alerts import collect_alerts
+from app.services.alert_notifications import queue_digest, dispatch_digest
 
 
 if __name__ == "__main__":
@@ -40,6 +42,11 @@ if __name__ == "__main__":
         assert client.post("/billing/live/webhook", content=b"signed-provider-event").status_code == 200
         with app.state.SessionLocal() as db:
             requests = {row.idempotency_key: row.id for row in db.scalars(select(ModelRequest))}
+            observation = collect_alerts(db, app.state.settings, app.state.platform_vault)
+        notification = queue_digest(app.state.SessionLocal, observation, "synthetic-ops@example.invalid")
+        class FakeSMTP:
+            def send_operator_alert(self, *args): pass
+        assert dispatch_digest(app.state.SessionLocal, notification, "synthetic-ops@example.invalid", FakeSMTP()) == "accepted"
 
         @app.get("/__fixture__/operator")
         def operator(profile: str = "read"):

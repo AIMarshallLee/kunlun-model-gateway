@@ -6,6 +6,7 @@ let language = "en", identity = null, active = null, offset = 0, selected = null
 let epoch = 0, expiryTimer = null, executing = false;
 const modules = [
   {id: "alerts", scope: "alerts:read", en: "Operational alerts", zh: "运营告警", path: "/ops/alerts", detail: "/ops/alerts/", field: "items"},
+  {id: "notifications", scope: "alerts:read", en: "Notification records", zh: "通知投递记录", path: "/ops/notifications", field: "items"},
   {id: "accounts", scope: "accounts:read", en: "Accounts & keys", zh: "客户与 Key", path: "/ops/accounts", detail: "/ops/accounts/", field: "items"},
   {id: "orders", scope: "payments:read", en: "Orders & refunds", zh: "订单与退款", path: "/ops/orders", detail: "/ops/orders/", field: "items"},
   {id: "requests", scope: "reconciliation:read", en: "Model reconciliation", zh: "模型对账", path: "/ops/reconciliation", detail: "/ops/requests/", field: "requests"},
@@ -117,7 +118,7 @@ async function load() {
   byId("records").replaceChildren(); byId("lookup").hidden = !active.detail;
   byId("next").disabled = true; byId("previous").disabled = true; byId("page").textContent = "";
   try {
-    const paginated = ["accounts", "orders", "requests", "models", "audit"].includes(active.id);
+    const paginated = ["accounts", "orders", "requests", "models", "notifications", "audit"].includes(active.id);
     const data = await client.request(active.path + (paginated ? `?limit=20&offset=${offset}` : ""));
     if (current !== epoch) return;
     const rows = active.field ? data[active.field] : [data];
@@ -126,6 +127,7 @@ async function load() {
     byId("previous").disabled = !paginated || offset === 0;
     byId("next").disabled = !paginated || offset + 20 >= total;
     if (!rows.length) notice(active.id === "alerts" ? say("No active conditions in evaluated rules. This is not readiness or notification-delivery proof.", "已评估规则暂无告警；这不证明生产就绪或通知送达。") : say("No records in this view.", "此视图暂无记录。"));
+    if (active.id === "notifications") notice(say("Accepted = SMTP accepted, not inbox delivery. Unconfirmed may already have been sent. No automatic resend or web send button.", "accepted 只代表 SMTP 接受，不代表进入收件箱；unconfirmed 可能已发出。不自动重发，页面没有发信按钮。"));
     byId("records").replaceChildren(...rows.map((row) => {
       const button = document.createElement("button"); button.className = "record"; button.type = "button";
       const title = document.createElement("strong"), summary = document.createElement("small");

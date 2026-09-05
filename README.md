@@ -55,6 +55,8 @@ Key 创建支持可选模型范围、单次输出上限和累计消费上限；�
 
 运营台可聚合预算、供给、售价、模型与支付异常，并记录“已知悉”；确认不会解除告警或释放资金。覆盖范围、权限及尚未接通的外部通知见 [运营告警验收](docs/OPS-ALERTS-ACCEPTANCE.md)。
 
+新增默认只预览的[告警邮件摘要 worker](docs/ALERT-NOTIFICATION-ACCEPTANCE.md)，复用持久化 outbox 与 SMTP，限制重复发送并保留未知结果。真实收件人/调度尚未启用，SMTP accepted 不等于收件箱送达。
+
 ## OpenCode / OpenAI-compatible 接入
 
 把网关作为 OpenAI-compatible provider，核心配置是：

@@ -207,7 +207,29 @@ def main():
         assert wallets_before == [(db.get(Wallet, uid).balance_microusd, db.get(Wallet, uid).reserved_microusd) for uid, _ in principals]
         assert next(row for row in collect_alerts(db, alert_settings, request_context.app.state.platform_vault)["items"]
                     if row["id"] == "platform_budget")["status"] == "attention"
+    # A real runtime role and concurrent workers share one durable mail claim.
+    # The injected transport does not contact any mail server.
+    from app.services.alert_notifications import queue_digest, dispatch_digest
+    from app.models import OutboxEvent
+    factory = sessionmaker(engine)
+    with factory() as db:
+        digest_observation = collect_alerts(db, alert_settings, request_context.app.state.platform_vault)
+    recipient = f"ci-{run}@example.invalid"
+    digest_now = utcnow()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        digest_ids = list(pool.map(lambda _: queue_digest(factory, digest_observation, recipient, now=digest_now), range(16)))
+    assert len(set(digest_ids)) == 1
+    mail_attempts = []
+    class FakeSMTP:
+        def send_operator_alert(self, address, notification_id, summary):
+            with factory() as db:
+                assert db.get(OutboxEvent, notification_id).status == "sending"
+            mail_attempts.append(notification_id)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        delivery_states = list(pool.map(lambda _: dispatch_digest(factory, digest_ids[0], recipient, FakeSMTP()), range(16)))
+    assert len(mail_attempts) == 1 and delivery_states.count("accepted") == 1
     engine.dispose()
+    print("Notification PostgreSQL race passed: 16 queues -> one record; 16 workers -> one simulated SMTP attempt outside the claim transaction.")
     print("Alert PostgreSQL race passed: duplicate receipt -> one immutable audit; wallets unchanged; condition remains active.")
     print("Price PostgreSQL races passed: competing v1 commands -> 201/409; historical settlement unchanged; no new admission after unlisting.")
     print("Key freeze PostgreSQL race passed: no new admission after freeze; existing holds can finalize.")
