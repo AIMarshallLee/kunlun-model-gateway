@@ -55,6 +55,16 @@ class ResetPasswordRequest(StrictModel):
 
 class KeyCreateRequest(StrictModel):
     name: str = Field(min_length=1, max_length=80)
+    allowed_models: list[str] | None = Field(default=None, min_length=1, max_length=100)
+    max_output_tokens: int | None = Field(default=None, strict=True, ge=1, le=1_000_000)
+    spend_limit_microusd: int | None = Field(default=None, strict=True, ge=1, le=10_000_000_000)
+
+    @field_validator("allowed_models")
+    @classmethod
+    def unique_models(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and (len(set(value)) != len(value) or any(not item or len(item) > 200 for item in value)):
+            raise ValueError("模型列表必须非空且不重复")
+        return value
 
 
 class KeyRevokeRequest(StrictModel):

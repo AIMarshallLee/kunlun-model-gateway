@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import Engine, text
 
 
-SCHEMA_HEAD = "0014_managed_gateway"
+SCHEMA_HEAD = "0015_key_policy"
 
 # Every application-owned table in the public schema.  Keep this allow-list
 # explicit: a Supabase deployment may contain unrelated extension tables that

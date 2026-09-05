@@ -47,6 +47,8 @@ python -m coverage run -m pytest -q && python -m coverage report
 
 请求调用前会按模型价格和输出上限预授权预算；上游返回完整有效 usage 时按实际 Token 结算并释放差额。BYOK 响应缺少或返回非法 usage 时不做估算结算，而是保留预授权并进入 `pending_reconciliation`；状态不确定的超时/异常同样不自动切换或静默退款。
 
+Key 创建支持可选模型范围、单次输出上限和累计消费上限；控制台支持中英文设置和查询。累计消费不自动重置，待对账请求继续占用，预算检查在审核/模型外呼之前执行。接口、迁移与并发验收详见 [Key 权限与累计上限](docs/KEY-POLICY-ACCEPTANCE.md)。
+
 ## OpenCode / OpenAI-compatible 接入
 
 把网关作为 OpenAI-compatible provider，核心配置是：

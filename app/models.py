@@ -59,12 +59,19 @@ class PasswordResetToken(Base):
 
 class ApiKey(Base):
     __tablename__ = "api_keys"
+    __table_args__ = (
+        CheckConstraint("max_output_tokens IS NULL OR max_output_tokens > 0", name="key_output_positive"),
+        CheckConstraint("spend_limit_microusd IS NULL OR spend_limit_microusd > 0", name="key_spend_positive"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(80))
     secret_digest: Mapped[str] = mapped_column(String(64))
     last_four: Mapped[str] = mapped_column(String(4))
+    allowed_models_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    spend_limit_microusd: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="active", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

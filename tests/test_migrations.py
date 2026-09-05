@@ -272,8 +272,15 @@ def test_upgrade_from_initial_to_production_hardening_on_sqlite(tmp_path):
     cfg = config_cls(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     cfg.set_main_option("sqlalchemy.url", db_url)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0014_managed_gateway")
     engine = create_engine(db_url)
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO users(id,email,password_hash,status,created_at) VALUES ('old-user','old@example.test','inert','active',CURRENT_TIMESTAMP)"))
+        connection.execute(text("INSERT INTO api_keys(id,user_id,name,secret_digest,last_four,status,created_at) VALUES ('old-key','old-user','old key','inert','test','active',CURRENT_TIMESTAMP)"))
+    command.upgrade(cfg, "head")
+    with engine.connect() as connection:
+        old_policy = connection.execute(text("SELECT allowed_models_json,max_output_tokens,spend_limit_microusd FROM api_keys WHERE id='old-key'")).one()
+        assert tuple(old_policy) == (None, None, None)
     tables = set(inspect(engine).get_table_names())
     assert {"payment_refunds", "safety_audits", "provider_connections", "credential_action_audits"}.issubset(tables)
     refund_columns = {item["name"] for item in inspect(engine).get_columns("payment_refunds")}
@@ -305,6 +312,11 @@ def test_upgrade_from_initial_to_production_hardening_on_sqlite(tmp_path):
             "compare_server_default": False,
         })
         assert compare_metadata(context, Base.metadata) == []
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE api_keys SET spend_limit_microusd=100 WHERE id='old-key'"))
+    with pytest.raises(RuntimeError, match="受限 API Key"):
+        command.downgrade(cfg, "0014_managed_gateway")
+    assert_schema_revision(engine, SCHEMA_HEAD)
 
 
 def test_production_startup_requires_exact_head_and_never_runs_create_all(tmp_path, monkeypatch):

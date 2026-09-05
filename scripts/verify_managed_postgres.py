@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.models import ApiKey, LedgerEntry, ModelPrice, ModelRequest, PlatformDailyBudget, User, Wallet
 from app.security import utcnow
-from app.services.gateway_billing import BillingError, reserve_model_request, release_model_request
+from app.services.gateway_billing import BillingError, key_usage, reserve_model_request, release_model_request
 from app.services.ledger import CUSTOMER_AVAILABLE, PLATFORM_CLEARING, post_transaction
 
 
@@ -94,7 +94,23 @@ def main():
         list(pool.map(mixed, range(24)))
     with Session(engine) as db:
         assert db.get(PlatformDailyBudget, utcnow().date().isoformat()).reserved_microusd == 0
+    # A key cap is narrower than both wallet and platform budget. With no key
+    # policy the platform admits two holds; the 4500 cap must admit only one.
+    user, key = principals[0]
+    with Session(engine) as db:
+        db.get(ApiKey, key).spend_limit_microusd = 4500
+        db.commit()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        key_admitted = [r for r in pool.map(lambda i: reserve(3000 + i * 3), range(16)) if r]
+    assert len(key_admitted) == 1, "concurrent requests bypassed the independent key cap"
+    with Session(engine) as db:
+        usage = key_usage(db, user, key)[key]
+        assert usage["spent_microusd"] == 0
+        assert usage["reserved_microusd"] == key_admitted[0].amount <= 4500
+        release_model_request(db, key_admitted[0].request_id, "ci_key_release")
+        assert key_usage(db, user, key)[key]["reserved_microusd"] == 0
     engine.dispose()
+    print("Key PostgreSQL concurrency passed: 16 distinct requests on one capped key -> 1 hold; release restored capacity.")
     print(f"Managed PostgreSQL concurrency passed: 3 tenants, 16 duplicate attempts -> 1 hold; 24 competing requests -> {len(admitted)} admitted; balanced ledgers and no negative wallets.")
 
 

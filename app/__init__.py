@@ -88,6 +88,8 @@ from .security import (
 from .services import budget as budget_service
 from .services.gateway_billing import (
     BillingError,
+    enforce_key_policy,
+    key_usage,
     mark_pending_reconciliation,
     record_attempt,
     release_model_request,
@@ -737,6 +739,10 @@ def create_app(
     def create_key(payload: KeyCreateRequest, principal: Principal = Depends(require_session)) -> dict[str, Any]:
         raw, parsed = issue_api_key()
         with app.state.SessionLocal() as session:
+            if payload.allowed_models is not None:
+                active_models = set(session.scalars(select(ModelPrice.model).where(ModelPrice.active.is_(True))))
+                if not set(payload.allowed_models).issubset(active_models):
+                    raise HTTPException(422, "API Key 模型范围包含未上架模型")
             try:
                 enforce_key_limit(session, principal.user_id, settings.max_active_api_keys)
             except IdentityError as exc:
@@ -747,14 +753,20 @@ def create_app(
                 name=payload.name,
                 secret_digest=token_digest(parsed.secret, settings.api_key_pepper),
                 last_four=parsed.secret[-4:],
+                allowed_models_json=json.dumps(payload.allowed_models) if payload.allowed_models is not None else None,
+                max_output_tokens=payload.max_output_tokens,
+                spend_limit_microusd=payload.spend_limit_microusd,
             ))
             session.commit()
-        return {"id": parsed.key_id, "name": payload.name, "key": raw, "warning": "仅显示一次"}
+        return {"id": parsed.key_id, "name": payload.name, "key": raw, "warning": "仅显示一次",
+                "allowed_models": payload.allowed_models, "max_output_tokens": payload.max_output_tokens,
+                "spend_limit_microusd": payload.spend_limit_microusd}
 
     @app.get("/v1/keys")
     def list_keys(principal: Principal = Depends(require_session)) -> dict[str, Any]:
         with app.state.SessionLocal() as session:
             records = session.scalars(select(ApiKey).where(ApiKey.user_id == principal.user_id).order_by(ApiKey.created_at)).all()
+            usage = key_usage(session, principal.user_id)
         return {"keys": [{
             "id": item.id,
             "name": item.name,
@@ -762,6 +774,12 @@ def create_app(
             "last_four": item.last_four,
             "created_at": item.created_at.isoformat(),
             "last_used_at": item.last_used_at.isoformat() if item.last_used_at else None,
+            "allowed_models": json.loads(item.allowed_models_json) if item.allowed_models_json is not None else None,
+            "max_output_tokens": item.max_output_tokens,
+            "spend_limit_microusd": item.spend_limit_microusd,
+            "spent_microusd": usage.get(item.id, {}).get("spent_microusd", 0),
+            "reserved_microusd": usage.get(item.id, {}).get("reserved_microusd", 0),
+            "available_microusd": max(0, item.spend_limit_microusd - sum(usage.get(item.id, {}).values())) if item.spend_limit_microusd is not None else None,
         } for item in records]}
 
     @app.post("/v1/keys/revoke", status_code=204)
@@ -1303,7 +1321,13 @@ def create_app(
     @app.get("/v1/models")
     def models(_principal: Principal = Depends(require_api_key)) -> dict[str, Any]:
         with app.state.SessionLocal() as session:
-            records = session.scalars(select(ModelPrice).where(ModelPrice.active.is_(True)).order_by(ModelPrice.model)).all()
+            key = session.get(ApiKey, _principal.api_key_id)
+            if key is None or key.status != "active":
+                raise HTTPException(401, "API Key 已失效")
+            query = select(ModelPrice).where(ModelPrice.active.is_(True))
+            if key.allowed_models_json is not None:
+                query = query.where(ModelPrice.model.in_(json.loads(key.allowed_models_json)))
+            records = session.scalars(query.order_by(ModelPrice.model)).all()
         return {"object": "list", "data": [{
             "id": item.model,
             "object": "model",
@@ -1331,6 +1355,12 @@ def create_app(
             return _openai_error(422, "输出 Token 上限超过平台策略", "max_output_tokens_exceeded")
         if settings.gateway_mode == "disabled":
             return _openai_error(503, "网关当前已禁用", "gateway_disabled")
+        with app.state.SessionLocal() as session:
+            key = session.get(ApiKey, principal.api_key_id)
+            try:
+                enforce_key_policy(key, payload.model, max_output)
+            except BillingError as exc:
+                return _openai_error(exc.status_code, str(exc), "key_policy_rejected")
         if idempotency_key:
             with app.state.SessionLocal() as session:
                 recorded = recorded_request_response(session, principal.user_id, idempotency_key)
@@ -1391,42 +1421,8 @@ def create_app(
             key: value for key, value in upstream_payload.items()
             if key not in {"stream", "stream_options"}
         }
-        input_audit_id: str | None = None
-        if app.state.content_safety is not None:
-            try:
-                input_decision: SafetyDecision = await app.state.content_safety.check(
-                    kind="input",
-                    model=payload.model,
-                    # Inspect the exact normalized object that will be sent
-                    # upstream, including tool descriptions and output schema.
-                    content=upstream_payload,
-                )
-                input_outcome = "allowed" if input_decision.allowed else "blocked"
-                input_reason = input_decision.reason_code
-                input_decision_id = input_decision.decision_id
-            except ContentSafetyError:
-                input_decision = SafetyDecision(False, "service_unavailable")
-                input_outcome = "unavailable"
-                input_reason = "service_unavailable"
-                input_decision_id = None
-            input_audit_id = str(uuid.uuid4())
-            with app.state.SessionLocal() as session:
-                session.add(SafetyAudit(
-                    id=input_audit_id,
-                    user_id=principal.user_id,
-                    api_key_id=principal.api_key_id or "",
-                    request_id=None,
-                    phase="input",
-                    outcome=input_outcome,
-                    reason_code=input_reason,
-                    decision_id=input_decision_id,
-                    policy_version=settings.content_safety_policy_version or None,
-                ))
-                session.commit()
-            if input_outcome == "unavailable":
-                return _openai_error(503, "内容安全服务不可用，已拒绝本次请求", "safety_unavailable")
-            if not input_decision.allowed:
-                return _openai_error(403, "请求未通过内容安全策略", "content_policy_rejected")
+        # Reserve before moderation too: a rejected budget must not trigger
+        # any paid/network service. A safety rejection releases the hold.
         with app.state.SessionLocal() as session:
             try:
                 reservation = (
@@ -1451,11 +1447,43 @@ def create_app(
                     if recorded is not None:
                         return recorded
                 return _openai_error(exc.status_code, str(exc), "billing_rejected")
-            if input_audit_id is not None:
-                session.execute(update(SafetyAudit).where(
-                    SafetyAudit.id == input_audit_id,
-                ).values(request_id=reservation.request_id))
+        if app.state.content_safety is not None:
+            try:
+                input_decision: SafetyDecision = await app.state.content_safety.check(
+                    kind="input",
+                    model=payload.model,
+                    # Inspect the exact normalized object that will be sent
+                    # upstream, including tool descriptions and output schema.
+                    content=upstream_payload,
+                )
+                input_outcome = "allowed" if input_decision.allowed else "blocked"
+                input_reason = input_decision.reason_code
+                input_decision_id = input_decision.decision_id
+            except ContentSafetyError:
+                input_decision = SafetyDecision(False, "service_unavailable")
+                input_outcome = "unavailable"
+                input_reason = "service_unavailable"
+                input_decision_id = None
+            input_audit_id = str(uuid.uuid4())
+            with app.state.SessionLocal() as session:
+                session.add(SafetyAudit(
+                    id=input_audit_id,
+                    user_id=principal.user_id,
+                    api_key_id=principal.api_key_id or "",
+                    request_id=reservation.request_id,
+                    phase="input",
+                    outcome=input_outcome,
+                    reason_code=input_reason,
+                    decision_id=input_decision_id,
+                    policy_version=settings.content_safety_policy_version or None,
+                ))
                 session.commit()
+                if not input_decision.allowed:
+                    release_model_request(session, reservation.request_id, "input_safety_" + input_outcome)
+            if input_outcome == "unavailable":
+                return _openai_error(503, "内容安全服务不可用，已拒绝本次请求", "safety_unavailable", request_id=reservation.request_id)
+            if not input_decision.allowed:
+                return _openai_error(403, "请求未通过内容安全策略", "content_policy_rejected", request_id=reservation.request_id)
         last_error: ProviderError | None = None
         route_deadline = time.monotonic() + request_limits.MANAGED_REQUEST_SECONDS if settings.gateway_mode == "managed_gateway" else None
         for index, candidate in enumerate(eligible):

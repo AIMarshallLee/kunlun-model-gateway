@@ -129,6 +129,13 @@
           <form id="key-form" class="inline-form">
             <label><span>用途名称</span><input name="name" maxlength="80" placeholder="例如：OpenCode 主工作区" required></label>
             <button type="submit">生成新 Key</button>
+            <details class="key-policy-fields">
+              <summary>可选权限与消费上限</summary>
+              <p>留空遵循账户与平台限制。累计上限不自动重置；待对账请求继续占用。创建后不能修改限制，需要吊销并创建新 Key。</p>
+              <label><span>允许模型（英文逗号分隔）</span><input name="allowed_models" maxlength="20000" placeholder="test-model, another-model"></label>
+              <label><span>单次输出 Token 上限</span><input name="max_output_tokens" type="number" min="1" max="1000000" step="1"></label>
+              <label><span>累计消费上限（microUSD；1 USD = 1000000）</span><input name="spend_limit_microusd" type="number" min="1" max="10000000000" step="1"></label>
+            </details>
           </form>
           <div class="one-time-secret" id="one-time-secret" hidden>
             <span>立即复制，关闭后无法找回</span>

@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app import create_app
-from app.models import ModelRequest, SafetyAudit
+from app.models import ModelRequest, SafetyAudit, Wallet
 from app.services.content_safety import ContentSafetyError, SafetyDecision
 
 
@@ -77,14 +77,18 @@ def test_blocked_input_never_reaches_provider_or_creates_billable_request(tmp_pa
         assert response.status_code == 403
         assert provider.await_count == 0
         with app.state.SessionLocal() as session:
-            assert session.scalar(select(ModelRequest)) is None
+            rejected = session.scalar(select(ModelRequest))
+            assert rejected.cost_state == "released" and rejected.charged_microusd == 0
+            wallet = session.scalar(select(Wallet))
+            assert wallet.reserved_microusd == 0 and wallet.balance_microusd == 100_000
             audit = session.scalar(select(SafetyAudit))
             assert audit is not None and audit.phase == "input" and audit.outcome == "blocked"
+            assert audit.request_id == rejected.id
     finally:
         client.__exit__(None, None, None)
 
 
-def test_blocked_tool_description_never_reaches_provider_or_reservation(tmp_path):
+def test_blocked_tool_description_never_reaches_provider_and_releases_reservation(tmp_path):
     safety = FakeSafety(block_phase="input")
     app, client, headers, provider = _funded(tmp_path, safety)
     try:
@@ -109,7 +113,9 @@ def test_blocked_tool_description_never_reaches_provider_or_reservation(tmp_path
         assert checked["tool_choice"] == "auto"
         assert checked["response_format"] == {"type": "json_object"}
         with app.state.SessionLocal() as session:
-            assert session.scalar(select(ModelRequest)) is None
+            rejected = session.scalar(select(ModelRequest))
+            assert rejected.cost_state == "released" and rejected.charged_microusd == 0
+            assert session.scalar(select(Wallet)).reserved_microusd == 0
     finally:
         client.__exit__(None, None, None)
 

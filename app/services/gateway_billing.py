@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -32,6 +32,50 @@ class BillingError(RuntimeError):
     def __init__(self, message: str, status_code: int = 402) -> None:
         self.status_code = status_code
         super().__init__(message)
+
+
+def key_usage(session: Session, user_id: str, key_id: str | None = None) -> dict[str, dict[str, int]]:
+    """Lifetime usage derived from logical requests, never provider attempts.
+
+    Unknown/nonterminal states retain the full hold. Audited BYOK overruns are
+    real spend, even if they exceed the cap; they block all future admissions.
+    Call under the User lock when making an admission decision.
+    """
+    settled = ModelRequest.cost_state.in_(("settled", "under_reserved"))
+    spent = case((settled, case((ModelRequest.billing_mode == "byok", ModelRequest.upstream_cost_microusd),
+                               else_=ModelRequest.charged_microusd)), else_=0)
+    held = case((ModelRequest.cost_state.in_(("settled", "under_reserved", "released")), 0),
+                else_=ModelRequest.reserved_microusd)
+    query = select(ModelRequest.api_key_id, func.sum(spent), func.sum(held)).where(ModelRequest.user_id == user_id)
+    if key_id is not None:
+        query = query.where(ModelRequest.api_key_id == key_id)
+    return {key: {"spent_microusd": int(spend), "reserved_microusd": int(reserve)}
+            for key, spend, reserve in session.execute(query.group_by(ModelRequest.api_key_id))}
+
+
+def enforce_key_policy(key: ApiKey | None, model: str, max_output_tokens: int) -> None:
+    if key is None or key.status != "active":
+        raise BillingError("API Key 已失效", 401)
+    if key.allowed_models_json is not None and model not in json.loads(key.allowed_models_json):
+        raise BillingError("API Key 不允许使用此模型", 403)
+    if key.max_output_tokens is not None and max_output_tokens > key.max_output_tokens:
+        raise BillingError("请求输出上限超过 API Key 策略", 422)
+
+
+def _reserve_key_policy(session: Session, key: ApiKey, model: str, max_output_tokens: int, amount: int) -> None:
+    try:
+        enforce_key_policy(key, model, max_output_tokens)
+        if key.spend_limit_microusd is not None:
+            # PostgreSQL admission is serialized by User -> ApiKey locks.
+            # The write also pins SQLite's local-test transaction before the
+            # aggregate; a competing writer must not read the same free cap.
+            session.execute(update(ApiKey).where(ApiKey.id == key.id).values(name=ApiKey.name))
+            usage = key_usage(session, key.user_id, key.id).get(key.id, {})
+            if usage.get("spent_microusd", 0) + usage.get("reserved_microusd", 0) + amount > key.spend_limit_microusd:
+                raise BillingError("API Key 累计消费上限不足", 402)
+    except BillingError:
+        session.rollback()
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +177,7 @@ def reserve_model_request(
         if key is None or key.status != "active":
             session.rollback()
             raise BillingError("API Key 已失效", 401)
+        _reserve_key_policy(session, key, model, max_output_tokens, reserve_amount)
         # This row is the per-customer serialization point shared with budget
         # replacement. It prevents a request from slipping through while an
         # active budget is being superseded or created.
@@ -263,13 +308,14 @@ def reserve_byok_model_request(
         input_token_reservation_upper_bound(billable_payload), price.input_microusd_per_million,
     ) + token_cost(max_output_tokens, price.output_microusd_per_million))
     try:
-        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True))
         key = session.scalar(select(ApiKey).where(
             ApiKey.id == api_key_id, ApiKey.user_id == user_id,
-        ).with_for_update())
+        ).with_for_update().execution_options(populate_existing=True))
         if user is None or user.status != "active" or key is None or key.status != "active":
             session.rollback()
             raise BillingError("账户或 API Key 不可用", 403)
+        _reserve_key_policy(session, key, model, max_output_tokens, reserve_amount)
         budget = active_budget(session, user_id, kind="provider_spend_cap")
         if budget is None:
             session.rollback()
@@ -404,7 +450,7 @@ def _locked_model_request(session: Session, request_id: str) -> ModelRequest | N
     """
     with session.no_autoflush:
         existing = session.get(ModelRequest, request_id)
-        if existing is not None and existing.billing_mode == "managed_gateway":
+        if existing is not None:
             # Admission also locks User first. Without this, a settlement
             # holding the global row can deadlock against an admission holding
             # the same customer's wallet (including FK key-share locks).

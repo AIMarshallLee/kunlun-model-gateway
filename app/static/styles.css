@@ -242,6 +242,10 @@ input:focus { border-bottom: 3px solid var(--signal); padding-bottom: 11px; }
 
 .inline-form { display: grid; grid-template-columns: 1fr 160px; gap: 18px; align-items: end; margin-bottom: 26px; }
 .inline-form button { justify-content: center; margin: 0; }
+.key-policy-fields { grid-column: 1 / -1; min-width: 0; border-top: 1px solid var(--line); padding-top: 14px; }
+.key-policy-fields summary { cursor: pointer; font-size: 14px; }
+.key-policy-fields p { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.key-policy-fields label { margin-top: 14px; }
 .one-time-secret { padding: 19px; color: var(--paper); background: var(--green); }
 .one-time-secret span { display: block; margin-bottom: 10px; font-size: 12px; }
 .one-time-secret code { display: block; padding: 12px; overflow-wrap: anywhere; color: #fff; background: rgba(0,0,0,.22); }

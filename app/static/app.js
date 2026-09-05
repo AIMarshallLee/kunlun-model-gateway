@@ -248,7 +248,10 @@ async function loadKeys() {
   if (!data.keys.length) return empty(target, t("尚未创建 API Key。"));
   target.replaceChildren(...data.keys.map((item) => record(
     `${item.name} · ••••${item.last_four}`,
-    t`${item.status} · 创建于 ${dateTime(item.created_at)}`,
+    [t`${item.status} · 创建于 ${dateTime(item.created_at)}`,
+      t`模型：${item.allowed_models?.join(", ") || t("账户允许的全部模型")} · 输出上限：${item.max_output_tokens ?? t("遵循平台限制")}`,
+      t`累计支出：${item.spent_microusd} · 占用：${item.reserved_microusd} · 剩余：${item.available_microusd ?? t("未设置 Key 上限")} microUSD`,
+    ].join(" / "),
     item.status === "active" ? t("吊销") : "",
     item.status === "active" ? async () => {
       if (!window.confirm(t`确认吊销 ${item.name}？此操作立即生效。`)) return;
@@ -529,7 +532,14 @@ byId("key-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   try {
-    const result = await api("/v1/keys", { method: "POST", body: formData(form) });
+    const fields = formData(form);
+    const body = {
+      name: fields.name,
+      allowed_models: fields.allowed_models.trim() ? fields.allowed_models.split(",").map((value) => value.trim()) : null,
+      max_output_tokens: fields.max_output_tokens ? Number(fields.max_output_tokens) : null,
+      spend_limit_microusd: fields.spend_limit_microusd ? Number(fields.spend_limit_microusd) : null,
+    };
+    const result = await api("/v1/keys", { method: "POST", body });
     byId("secret-value").textContent = result.key;
     byId("one-time-secret").hidden = false;
     form.reset();
