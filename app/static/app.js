@@ -252,8 +252,8 @@ async function loadKeys() {
       t`模型：${item.allowed_models?.join(", ") || t("账户允许的全部模型")} · 输出上限：${item.max_output_tokens ?? t("遵循平台限制")}`,
       t`累计支出：${item.spent_microusd} · 占用：${item.reserved_microusd} · 剩余：${item.available_microusd ?? t("未设置 Key 上限")} microUSD`,
     ].join(" / "),
-    item.status === "active" ? t("吊销") : "",
-    item.status === "active" ? async () => {
+    ["active", "frozen"].includes(item.status) ? t("吊销") : "",
+    ["active", "frozen"].includes(item.status) ? async () => {
       if (!window.confirm(t`确认吊销 ${item.name}？此操作立即生效。`)) return;
       await api("/v1/keys/revoke", { method: "POST", body: { key_id: item.id } });
       showToast(t("API Key 已吊销"));

@@ -109,7 +109,28 @@ def main():
         assert usage["reserved_microusd"] == key_admitted[0].amount <= 4500
         release_model_request(db, key_admitted[0].request_id, "ci_key_release")
         assert key_usage(db, user, key)[key]["reserved_microusd"] == 0
+    # Exercise the actual key-freeze handler against concurrent admission,
+    # including its audit insert under the restricted runtime database role.
+    # HTTP token/ingress checks are covered separately by API/browser tests.
+    from types import SimpleNamespace
+    from sqlalchemy.orm import sessionmaker
+    from app.ops_console import KeyStatusRequest, key_status
+    from app.services.ops_tokens import OperatorClaims
+    request_context = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), app=SimpleNamespace(state=SimpleNamespace(
+        SessionLocal=sessionmaker(engine), settings=SimpleNamespace(session_pepper="ci-inert-pepper"))))
+    claims = OperatorClaims("ci-operator", frozenset({"accounts:write"}), 0, 1, "ci-inert-token")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        pending = [pool.submit(reserve, 6000 + i * 3) for i in range(16)]
+        frozen = pool.submit(key_status, key, KeyStatusRequest(action="freeze", expected_status="active",
+            reason="isolated concurrent key freeze acceptance"), request_context, claims)
+        raced = [result for future in pending if (result := future.result()) is not None]
+        assert frozen.result()["status"] == "frozen"
+    assert reserve(9000) is None, "a new admission crossed the committed key freeze"
+    for reservation in raced:
+        with Session(engine) as db:
+            release_model_request(db, reservation.request_id, "ci_frozen_key_existing_hold")
     engine.dispose()
+    print("Key freeze PostgreSQL race passed: no new admission after freeze; existing holds can finalize.")
     print("Key PostgreSQL concurrency passed: 16 distinct requests on one capped key -> 1 hold; release restored capacity.")
     print(f"Managed PostgreSQL concurrency passed: 3 tenants, 16 duplicate attempts -> 1 hold; 24 competing requests -> {len(admitted)} admitted; balanced ledgers and no negative wallets.")
 

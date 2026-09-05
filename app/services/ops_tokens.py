@@ -12,6 +12,8 @@ import time
 
 
 ALLOWED_SCOPES = {
+    "console:read",
+    "audit:read",
     "channels:read",
     "channels:write",
     "reconciliation:read",

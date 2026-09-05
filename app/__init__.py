@@ -361,6 +361,8 @@ def create_app(
     else:
         providers.ordered_clients = []
     static_dir = Path(__file__).resolve().parent / "static"
+    from .ops_console import router as ops_console_router
+    app.include_router(ops_console_router)
     app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
     app.add_middleware(RequestBodyLimitMiddleware)
     if settings.captcha_required and settings.captcha_provider == "turnstile":
@@ -794,7 +796,7 @@ def create_app(
             result = session.execute(update(ApiKey).where(
                 ApiKey.id == key_id,
                 ApiKey.user_id == principal.user_id,
-                ApiKey.status == "active",
+                ApiKey.status.in_(("active", "frozen")),
             ).values(status="revoked", revoked_at=utcnow()))
             if result.rowcount != 1:
                 session.rollback()
@@ -2000,6 +2002,8 @@ def create_app(
             if user is None:
                 raise HTTPException(status_code=404, detail="账户不存在")
             before_status = user.status
+            if payload.expected_status is not None and payload.expected_status != before_status:
+                raise HTTPException(409, "账户状态已改变，请刷新后重新核查")
             revoked_keys = 0
             if payload.action == "freeze":
                 if before_status != "frozen":

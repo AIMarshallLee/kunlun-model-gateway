@@ -302,7 +302,7 @@ def reset_password(session, raw_token: str, new_password: str, pepper: str, _ses
     session.execute(update(AccessSession).where(AccessSession.user_id == record.user_id).values(revoked=True))
     session.execute(update(ApiKey).where(
         ApiKey.user_id == record.user_id,
-        ApiKey.status == "active",
+        ApiKey.status.in_(("active", "frozen")),
     ).values(status="revoked", revoked_at=now))
     session.commit()
     session.expire_all()
@@ -326,7 +326,7 @@ def enforce_key_limit(session, user_id: str, max_active_keys: int) -> None:
         raise IdentityError("邮箱尚未验证")
     count = session.scalar(select(func.count()).select_from(ApiKey).where(
         ApiKey.user_id == user_id,
-        ApiKey.status == "active",
+        ApiKey.status.in_(("active", "frozen")),
     )) or 0
     if count >= max_active_keys:
         raise IdentityError("API Key 数量已达到上限")
@@ -346,7 +346,7 @@ def apply_user_freeze(session, user_id: str, *, now: datetime | None = None) -> 
     frozen_at = now or utcnow()
     key_count = session.execute(update(ApiKey).where(
         ApiKey.user_id == user_id,
-        ApiKey.status == "active",
+        ApiKey.status.in_(("active", "frozen")),
     ).values(status="revoked", revoked_at=frozen_at)).rowcount
     session.execute(update(AccessSession).where(AccessSession.user_id == user_id, AccessSession.revoked.is_(False)).values(revoked=True))
     session.execute(update(EmailVerificationToken).where(

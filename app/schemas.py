@@ -109,6 +109,7 @@ class RefundRiskDispositionRequest(StrictModel):
 class AccountStatusRequest(StrictModel):
     action: Literal["freeze", "unfreeze"]
     reason: str = Field(min_length=10, max_length=500)
+    expected_status: Literal["active", "frozen"] | None = None
 
 
 class BudgetAmountRequest(StrictModel):

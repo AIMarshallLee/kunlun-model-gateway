@@ -49,6 +49,8 @@ python -m coverage run -m pytest -q && python -m coverage report
 
 Key 创建支持可选模型范围、单次输出上限和累计消费上限；控制台支持中英文设置和查询。累计消费不自动重置，待对账请求继续占用，预算检查在审核/模型外呼之前执行。接口、迁移与并发验收详见 [Key 权限与累计上限](docs/KEY-POLICY-ACCEPTANCE.md)。
 
+独立运营台入口 `/ops/console`，使用短时分权限运维凭证，不接受客户 Key。可查询客户/订单/待对账/渠道/预算/审计，确认后执行已有运维流程。能力、权限、模拟验收及未完成项见 [运营台交付记录](docs/OPS-CONSOLE-ACCEPTANCE.md)。
+
 ## OpenCode / OpenAI-compatible 接入
 
 把网关作为 OpenAI-compatible provider，核心配置是：

@@ -72,10 +72,12 @@ def test_vercel_ingress_overwrites_spoofed_proxy_headers_and_hides_ops(tmp_path,
         }
         ready = client.get("/readyz", headers=headers)
         private = client.get("/ops/reconciliation", headers=headers)
+        private_console = client.get("/ops/console", headers=headers)
         encoded_private = client.get("/%256f%2570%2573/reconciliation", headers=headers)
 
     assert ready.status_code == 200
     assert private.status_code == 404
+    assert private_console.status_code == 404
     assert encoded_private.status_code == 404
 
 
