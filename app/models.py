@@ -235,6 +235,16 @@ class ModelPrice(Base):
     effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class PlatformDailyBudget(Base):
+    __tablename__ = "platform_daily_budgets"
+    __table_args__ = (CheckConstraint("limit_microusd > 0 AND spent_microusd >= 0 AND reserved_microusd >= 0", name="platform_budget_nonnegative"),)
+
+    period: Mapped[str] = mapped_column(String(10), primary_key=True)
+    limit_microusd: Mapped[int] = mapped_column(BigInteger)
+    spent_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    reserved_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
 class ModelRequest(Base):
     __tablename__ = "model_requests"
     __table_args__ = (
@@ -255,6 +265,8 @@ class ModelRequest(Base):
     final_provider: Mapped[str | None] = mapped_column(String(80), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="reserved", index=True)
     billing_mode: Mapped[str] = mapped_column(String(24), default="prepaid", index=True)
+    platform_budget_period: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    platform_reserved_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
     price_version: Mapped[int] = mapped_column(Integer)
     input_price: Mapped[int] = mapped_column(BigInteger)
     output_price: Mapped[int] = mapped_column(BigInteger)

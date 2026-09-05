@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from ..models import ApiKey, Budget, ModelPrice, ModelRequest, ProviderAttempt, User, Wallet
 from ..security import utcnow
 from .budget import active_budget
+from .platform_budget import reserve_platform_cost, finalize_platform_cost
 from .ledger import (
     CUSTOMER_AVAILABLE,
     CUSTOMER_RESERVED,
@@ -70,7 +71,7 @@ def input_token_reservation_upper_bound(value: Any) -> int:
 def token_cost(tokens: int, price_per_million: int) -> int:
     if tokens <= 0 or price_per_million <= 0:
         return 0
-    return math.ceil(tokens * price_per_million / 1_000_000)
+    return (tokens * price_per_million + 999_999) // 1_000_000
 
 
 def get_price(session: Session, model: str) -> ModelPrice | None:
@@ -89,6 +90,8 @@ def reserve_model_request(
     billable_payload: Any,
     max_output_tokens: int,
     idempotency_key: str | None,
+    managed_cost_prices: tuple[int, int] | None = None,
+    platform_daily_limit: int = 0,
 ) -> Reservation:
     price = get_price(session, model)
     if price is None:
@@ -118,7 +121,7 @@ def reserve_model_request(
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        if user is None or user.status != "active":
+        if user is None or user.status != "active" or (managed_cost_prices is not None and user.email_verified_at is None):
             session.rollback()
             raise BillingError("账户不可用", 403)
         key = session.scalar(
@@ -170,6 +173,15 @@ def reserve_model_request(
             if budget_result.rowcount != 1:
                 session.rollback()
                 raise BillingError("预算已更新或并发占用，请重试", 409)
+        platform_period = None
+        platform_reserve = 0
+        if managed_cost_prices is not None:
+            platform_reserve = max(1, token_cost(reserved_input, managed_cost_prices[0]) + token_cost(max_output_tokens, managed_cost_prices[1]))
+            try:
+                platform_period = reserve_platform_cost(session, platform_daily_limit, platform_reserve)
+            except ValueError as exc:
+                session.rollback()
+                raise BillingError(str(exc), 503) from exc
         request_id = str(uuid.uuid4())
         request = ModelRequest(
             id=request_id,
@@ -179,6 +191,9 @@ def reserve_model_request(
             idempotency_key=idempotency_key,
             requested_model=model,
             status="reserved",
+            billing_mode="managed_gateway" if managed_cost_prices is not None else "prepaid",
+            platform_budget_period=platform_period,
+            platform_reserved_microusd=platform_reserve,
             price_version=price.version,
             input_price=price.input_microusd_per_million,
             output_price=price.output_microusd_per_million,
@@ -387,12 +402,19 @@ def _locked_model_request(session: Session, request_id: str) -> ModelRequest | N
     preloaded a request for auditing: without it, SQLAlchemy can evaluate the
     old status before acquiring the row lock.
     """
-    return session.get(
-        ModelRequest,
-        request_id,
-        populate_existing=True,
-        with_for_update=True,
-    )
+    with session.no_autoflush:
+        existing = session.get(ModelRequest, request_id)
+        if existing is not None and existing.billing_mode == "managed_gateway":
+            # Admission also locks User first. Without this, a settlement
+            # holding the global row can deadlock against an admission holding
+            # the same customer's wallet (including FK key-share locks).
+            session.get(User, existing.user_id, populate_existing=True, with_for_update=True)
+        return session.get(
+            ModelRequest,
+            request_id,
+            populate_existing=True,
+            with_for_update=True,
+        )
 
 
 def settle_model_request(
@@ -415,12 +437,12 @@ def settle_model_request(
         raise BillingError("请求不处于可结算状态", 409)
     input_tokens, output_tokens, usage_estimated = _usage_from_response(response, request.input_tokens)
     usage_estimated = usage_estimated or force_usage_estimated
-    if request.billing_mode == "byok" and usage_estimated:
-        # A customer-owned provider charge cannot be inferred from output
-        # characters. Keep its durable hold until an operator reconciles the
+    if request.billing_mode in {"byok", "managed_gateway"} and usage_estimated:
+        # A provider charge cannot be inferred from output characters.
+        # Keep its durable hold until an operator reconciles the
         # provider's authoritative usage and cost.
         session.rollback()
-        raise BillingError("BYOK 响应缺少完整有效 usage，已转人工对账", 409)
+        raise BillingError("上游响应缺少完整有效 usage，已转人工对账", 409)
     customer_cost = token_cost(input_tokens, request.input_price) + token_cost(output_tokens, request.output_price)
     upstream_cost = (
         int(upstream_cost_override)
@@ -435,6 +457,10 @@ def settle_model_request(
     )
     if upstream_cost < 0:
         raise BillingError("上游成本不能为负数", 422)
+    if request.billing_mode == "managed_gateway":
+        if upstream_cost > request.platform_reserved_microusd and not (allow_budget_overrun and request.status == "pending_reconciliation"):
+            session.rollback()
+            raise BillingError("平台上游成本超过预授权，需人工对账", 409)
     if request.billing_mode == "byok":
         if not request.budget_id:
             raise BillingError("BYOK 请求缺少供应商预算", 409)
@@ -516,6 +542,11 @@ def settle_model_request(
         if budget_result.rowcount != 1:
             session.rollback()
             raise BillingError("预算预授权状态异常", 409)
+    try:
+        finalize_platform_cost(session, request, upstream_cost)
+    except ValueError as exc:
+        session.rollback()
+        raise BillingError(str(exc), 409) from exc
     post_transaction(
         session,
         user_id=request.user_id,
@@ -596,6 +627,11 @@ def release_model_request(
         if budget_result.rowcount != 1:
             session.rollback()
             raise BillingError("预算预授权状态异常", 409)
+    try:
+        finalize_platform_cost(session, request, 0)
+    except ValueError as exc:
+        session.rollback()
+        raise BillingError(str(exc), 409) from exc
     post_transaction(
         session,
         user_id=request.user_id,

@@ -1,12 +1,12 @@
 # Kunlun Model Gateway
 
-Kunlun Model Gateway 的生产目标是受控的 BYOK 垂直工作流：把多模型适配、预算硬阈值、成本台账与故障切换作为业务产品的后台能力，而不是匿名公共中转站。它是一个 FastAPI + SQLAlchemy 独立部署单元，提供账户、API Key、Provider 连接、整数 microUSD 成本台账、预算预授权/结算，以及受限的 OpenAI-compatible 多供应商调用；不进入公众号客户桌面包。
+Kunlun Model Gateway 当前开发目标是海外商业模型 API 聚合站：客户注册、验证邮箱、购买调用额度、创建本站 Key，通过统一 API 使用平台接入的模型。目标基线见 [商业中转站 PRD](docs/PRD-overseas-commercial-api-gateway.md)。BYOK 保留为独立可选模式，不再替代主产品。项目是 FastAPI + SQLAlchemy 独立部署单元，不进入公众号客户桌面包。
 
-本项目不提供共享账号、低价 Key、无限量承诺、匿名公共 API 充值或共享余额。BYOK 模式下客户连接自己的官方或可信 Provider 账号，模型费用由客户承担；旧的充值/支付代码仅保留为隔离的兼容能力，不能据此宣称已有商户收款或公共平台。
+本项目不提供共享订阅账号、来源不明的 Key、无限量承诺、未验证匿名调用、提现或余额转账。`managed_gateway` 模式由平台提供独立 Vault 凭据，客户余额与平台成本预算分别控制；`byok` 模式由客户支付供应商模型费。
 
-当前交付是“可审计的单节点候选生产基线”，不是已经完成商户收款、备案或公网运营的产品。默认关闭公开注册、测试支付和真实上游；支付 bridge 只是与官方 SDK sidecar 的协议适配层，不能把测试回调、服务额度或本地 Docker 环境称为真实收款。
+当前是商业内核开发候选，尚未完成整站商业化。实现和剩余门槛见 [商业内核验收说明](docs/MANAGED-CORE-ACCEPTANCE.md)。默认关闭公开注册、测试支付和真实上游；支付 bridge 仍只是官方 SDK sidecar 的协议适配层，正式支付渠道尚未选定接通，不能把模拟回调或本地 Docker 称为真实收款。
 
-生产交付请从 [客户开通与上线验收手册](docs/CUSTOMER-DELIVERY.md) 开始。它列出了运营人员与客户各自的步骤、异常处理和售后边界。下方快速启动是旧额度模式的本地模拟，不是生产 BYOK 开通方式。
+原 [客户开通与上线验收手册](docs/CUSTOMER-DELIVERY.md) 和生产环境模板仍针对 BYOK，不能直接作为商业站发布指南。下方快速启动是旧额度模式的本地模拟；新商业模式使用显式注入的测试适配器验收，不允许打开旧 `legacy_test` 模式上线。
 
 ## 快速启动（本地模拟，非生产 BYOK）
 
@@ -43,7 +43,7 @@ python -m coverage run -m pytest -q && python -m coverage report
 3. `POST /v1/keys` 创建 API Key。原始 Key 只返回一次，数据库只保存摘要；丢失后只能吊销并新建。
 4. 受控验证阶段：开发环境可用 `POST /billing/topups` 创建测试订单并向 `POST /billing/webhook` 提交 HMAC 测试回调；正式环境的 `POST /billing/checkout` 仅通过独立 HTTPS payment bridge 调用官方 SDK sidecar，`POST /billing/live/webhook` 接收验签回调。没有真实商户凭据时保持关闭。
 5. `GET /billing/balance` 查看服务额度，`GET /billing/ledger` 查看只追加账本，`GET /billing/costs` 查看请求成本。
-6. `POST /v1/chat/completions` 使用 API Key 调用；生产 BYOK 请求还必须携带稳定的 `Idempotency-Key`，`GET /v1/models` 查看已定价模型。
+6. `POST /v1/chat/completions` 使用 API Key 调用；所有 `managed_gateway` 和生产 BYOK 请求必须携带稳定的 `Idempotency-Key`，`GET /v1/models` 查看已定价模型。
 
 请求调用前会按模型价格和输出上限预授权预算；上游返回完整有效 usage 时按实际 Token 结算并释放差额。BYOK 响应缺少或返回非法 usage 时不做估算结算，而是保留预授权并进入 `pending_reconciliation`；状态不确定的超时/异常同样不自动切换或静默退款。
 

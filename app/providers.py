@@ -303,6 +303,12 @@ def provider_name(client: ProviderCallable, index: int) -> str:
     return value if isinstance(value, str) and value else f"provider-{index + 1}"
 
 
+def build_managed_provider_client(config, *, api_key, allowed_hosts):
+    # Same pinned official-endpoint contract; credentials come from a separate
+    # platform Vault, never from the client or environment catalog.
+    return build_byok_provider_client(config, api_key=api_key, allowed_hosts=allowed_hosts)
+
+
 def supports_model(client: ProviderCallable, model: str) -> bool:
     # Read from the class so dynamic mocks cannot fabricate an awaitable
     # ``supports_model`` attribute and leak an un-awaited coroutine.

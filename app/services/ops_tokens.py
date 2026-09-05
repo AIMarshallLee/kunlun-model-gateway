@@ -12,6 +12,8 @@ import time
 
 
 ALLOWED_SCOPES = {
+    "channels:read",
+    "channels:write",
     "reconciliation:read",
     "reconciliation:write",
     "accounts:read",

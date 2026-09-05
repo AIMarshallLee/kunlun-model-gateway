@@ -5,12 +5,13 @@ from __future__ import annotations
 from sqlalchemy import Engine, text
 
 
-SCHEMA_HEAD = "0013_byok_budget_reconciliation"
+SCHEMA_HEAD = "0014_managed_gateway"
 
 # Every application-owned table in the public schema.  Keep this allow-list
 # explicit: a Supabase deployment may contain unrelated extension tables that
 # must not accidentally receive Kunlun grants or policies.
 KUNLUN_BUSINESS_TABLES = (
+    "platform_daily_budgets",
     "users",
     "access_sessions",
     "api_keys",

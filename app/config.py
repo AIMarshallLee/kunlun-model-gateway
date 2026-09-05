@@ -196,6 +196,8 @@ class Settings:
     live_payments: bool = False
     live_upstream: bool = False
     gateway_mode: str = "legacy_test"
+    platform_daily_budget_microusd: int = 0
+    supplier_use_acknowledged: bool = False
     vault_backend: str = "disabled"
     vault_executor_database_url: str = ""
     payment_webhook_secret: str = ""
@@ -303,6 +305,8 @@ class Settings:
             "live_payments": _env_bool("KUNLUN_LIVE_PAYMENTS"),
             "live_upstream": _env_bool("KUNLUN_LIVE_UPSTREAM"),
             "gateway_mode": os.getenv("KUNLUN_GATEWAY_MODE", "legacy_test"),
+            "platform_daily_budget_microusd": int(os.getenv("KUNLUN_PLATFORM_DAILY_BUDGET_MICROUSD", "0")),
+            "supplier_use_acknowledged": os.getenv("KUNLUN_SUPPLIER_USE_ACKNOWLEDGED", "false").lower() == "true",
             "vault_backend": os.getenv("KUNLUN_VAULT_BACKEND", "disabled"),
             "vault_executor_database_url": os.getenv("KUNLUN_VAULT_EXECUTOR_DATABASE_URL", ""),
             "payment_webhook_secret": os.getenv("KUNLUN_PAYMENT_WEBHOOK_SECRET", ""),
@@ -428,20 +432,52 @@ class Settings:
             raise RuntimeError("真实模型上游与真实支付仅允许在 production 环境开启")
         self.gateway_mode = str(self.gateway_mode).strip().casefold()
         self.vault_backend = str(self.vault_backend).strip().casefold()
-        if self.gateway_mode not in {"disabled", "byok", "legacy_test"}:
-            raise RuntimeError("KUNLUN_GATEWAY_MODE 仅支持 disabled、byok 或 legacy_test")
+        if self.gateway_mode not in {"disabled", "byok", "legacy_test", "managed_gateway"}:
+            raise RuntimeError("KUNLUN_GATEWAY_MODE 仅支持 disabled、byok、managed_gateway 或 legacy_test")
+        if self.gateway_mode == "managed_gateway":
+            if not 1 <= self.platform_daily_budget_microusd <= 1_000_000_000_000:
+                raise RuntimeError("平台模式必须配置正整数 KUNLUN_PLATFORM_DAILY_BUDGET_MICROUSD")
+            if self.environment not in {"production", "test"}:
+                raise RuntimeError("平台商业模式仅允许 production 或显式注入适配器的 test")
+            if not self.require_email_verification:
+                raise RuntimeError("平台商业模式必须启用邮箱验证")
+            if self.is_production and (not self.live_upstream or not self.supplier_use_acknowledged):
+                raise RuntimeError("平台商业模式必须明确启用上游并确认供应商商业用途依据")
+            if not isinstance(self.providers, list) or not 1 <= len(self.providers) <= 3:
+                raise RuntimeError("平台首发目录必须包含 1 到 3 个允许渠道")
+            seen_providers = set()
+            for provider in self.providers:
+                if not isinstance(provider, dict) or set(provider) - {"name", "base_url", "models", "pricing"}:
+                    raise RuntimeError("平台模型目录仅允许模型、端点和价格，不接受内联密钥或 api_key_env")
+                name = provider.get("name")
+                if not isinstance(name, str) or name not in BYOK_PROVIDER_CATALOG or name in seen_providers:
+                    raise RuntimeError("平台渠道名称必须来自允许目录且不得重复")
+                seen_providers.add(name)
+                if not isinstance(provider.get("base_url"), str):
+                    raise RuntimeError("平台渠道必须配置官方端点")
+                validate_byok_provider_endpoint(name, provider["base_url"])
+                models = provider.get("models")
+                if not isinstance(models, list) or not models or any(not isinstance(m, str) or m not in self.models for m in models) or len(set(models)) != len(models):
+                    raise RuntimeError("平台渠道模型必须来自售卖目录且不得重复")
+                pricing = provider.get("pricing")
+                fields = {"input_microusd_per_million", "output_microusd_per_million"}
+                if not isinstance(pricing, dict) or set(pricing) != set(models):
+                    raise RuntimeError("平台渠道必须为每个模型配置成本价格")
+                for prices in pricing.values():
+                    if not isinstance(prices, dict) or set(prices) != fields or any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 1_000_000_000_000 for v in prices.values()):
+                        raise RuntimeError("平台渠道成本价格必须为非负整数 microUSD")
         if self.environment in {"staging", "production"} and self.gateway_mode == "legacy_test":
             raise RuntimeError("staging/production 环境禁止 KUNLUN_GATEWAY_MODE=legacy_test")
         if (
-            self.gateway_mode == "byok"
+            self.gateway_mode in {"byok", "managed_gateway"}
             and os.getenv("VERCEL_ENV", "").strip().casefold() not in {"", "production"}
         ):
             raise RuntimeError("Vercel Preview/Development deployment 禁止启用 BYOK")
         if self.vault_backend not in {"disabled", "supabase_vault"}:
             raise RuntimeError("KUNLUN_VAULT_BACKEND 仅支持 disabled 或 supabase_vault")
-        if self.gateway_mode == "byok" and self.is_production and self.vault_backend != "supabase_vault":
+        if self.gateway_mode in {"byok", "managed_gateway"} and self.is_production and self.vault_backend != "supabase_vault":
             raise RuntimeError("production BYOK 必须配置 Supabase Vault")
-        if self.gateway_mode == "byok" and self.is_production:
+        if self.gateway_mode in {"byok", "managed_gateway"} and self.is_production:
             runtime_user = _database_user(self.database_url)
             executor_user = _database_user(self.vault_executor_database_url)
             if not _production_database_url_is_safe(self.vault_executor_database_url):
@@ -462,13 +498,13 @@ class Settings:
                 raise RuntimeError(
                     "runtime 与 Vault executor 必须连接同一可识别的 Supabase project/database"
                 )
-        if self.gateway_mode != "byok" and self.vault_backend != "disabled":
+        if self.gateway_mode not in {"byok", "managed_gateway"} and self.vault_backend != "disabled":
             raise RuntimeError("仅 BYOK 模式允许配置 Credential Vault")
         if self.gateway_mode == "byok" and self.environment not in {"production", "test"}:
             raise RuntimeError("BYOK 仅允许在 production 或 test 环境运行")
-        if self.gateway_mode == "byok" and (not self.providers or not self.provider_host_allowlist):
+        if self.gateway_mode in {"byok", "managed_gateway"} and (not self.providers or not self.provider_host_allowlist):
             raise RuntimeError("BYOK 必须配置服务端 Provider 目录和主机允许列表")
-        upstream_active = self.live_upstream or self.gateway_mode == "byok"
+        upstream_active = self.live_upstream or self.gateway_mode in {"byok", "managed_gateway"}
         if self.rate_limit_per_minute < 1:
             raise RuntimeError("rate_limit_per_minute 必须大于 0")
         if not 1 <= self.checkout_rate_limit_per_minute <= 60:
@@ -603,15 +639,15 @@ class Settings:
                 raise RuntimeError("正式支付适配器配置或官方 SDK 确认不完整")
         if self.is_production:
             missing = []
-            if self.gateway_mode not in {"disabled", "byok"}:
+            if self.gateway_mode not in {"disabled", "byok", "managed_gateway"}:
                 missing.append("production 仅允许 KUNLUN_GATEWAY_MODE=byok 或 disabled")
-            if self.public_signup:
+            if self.public_signup and self.gateway_mode != "managed_gateway":
                 missing.append("关闭 KUNLUN_PUBLIC_SIGNUP（production 不提供公共注册）")
             if self.enable_test_payments:
                 missing.append("关闭 KUNLUN_ENABLE_TEST_PAYMENTS")
-            if self.live_payments:
+            if self.live_payments and self.gateway_mode != "managed_gateway":
                 missing.append("关闭 KUNLUN_LIVE_PAYMENTS（BYOK 产品不提供充值）")
-            if self.topup_packages:
+            if self.topup_packages and self.gateway_mode != "managed_gateway":
                 missing.append("清空 KUNLUN_TOPUP_PACKAGES_JSON（BYOK 产品不提供余额或充值套餐）")
             if self.gateway_mode == "byok" and self.live_upstream:
                 missing.append("BYOK 必须关闭 KUNLUN_LIVE_UPSTREAM（禁止服务端共享上游密钥）")
@@ -704,7 +740,7 @@ class Settings:
                     if normalized_provider_name in provider_names:
                         missing.append(f"Provider 名称重复: {provider_name}")
                     provider_names.add(normalized_provider_name)
-                    if self.gateway_mode == "byok":
+                    if self.gateway_mode in {"byok", "managed_gateway"}:
                         parsed_provider_url = urlparse(str(provider.get("base_url") or ""))
                         if normalized_provider_name not in BYOK_PROVIDER_CATALOG:
                             missing.append(f"BYOK Provider 不在允许目录: {provider_name}")

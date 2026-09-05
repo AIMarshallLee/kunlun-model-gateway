@@ -50,7 +50,7 @@ def require_session(
         if record is None or as_utc(record.expires_at) <= utcnow():
             raise HTTPException(status_code=401, detail="会话凭证无效或已过期")
         user = session.get(User, record.user_id)
-        if user is None or user.status != "active":
+        if user is None or user.status != "active" or (settings.gateway_mode == "managed_gateway" and user.email_verified_at is None):
             raise HTTPException(status_code=401, detail="账户不可用")
         return Principal(user_id=user.id)
 
@@ -149,7 +149,7 @@ def require_api_key(
         if record.status != "active" or not hmac.compare_digest(actual_digest, record.secret_digest):
             raise HTTPException(status_code=401, detail="API Key 无效")
         user = session.get(User, record.user_id)
-        if user is None or user.status != "active":
+        if user is None or user.status != "active" or (settings.gateway_mode == "managed_gateway" and user.email_verified_at is None):
             raise HTTPException(status_code=401, detail="账户不可用")
         session.execute(update(ApiKey).where(ApiKey.id == record.id).values(last_used_at=utcnow()))
         session.commit()

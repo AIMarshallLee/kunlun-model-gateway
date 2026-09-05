@@ -679,7 +679,7 @@ def main() -> int:
         return 1
     if not settings.is_production:
         errors.append("KUNLUN_ENV=production")
-    if settings.gateway_mode == "byok" and (
+    if settings.gateway_mode in {"byok", "managed_gateway"} and (
         not settings.identity_token_pepper_persisted or len(settings.identity_token_pepper) < 32
     ):
         errors.append("客户开通需要持久化的 KUNLUN_IDENTITY_TOKEN_PEPPER（至少 32 字符）")
@@ -695,11 +695,11 @@ def main() -> int:
     errors.extend(_database_credential_errors(
         settings.database_url,
         migrator_url,
-        executor_url if settings.gateway_mode == "byok" else "",
+        executor_url if settings.gateway_mode in {"byok", "managed_gateway"} else "",
     ))
-    if settings.gateway_mode == "byok":
+    if settings.gateway_mode in {"byok", "managed_gateway"}:
         errors.extend(_database_target_errors(settings.database_url, migrator_url, executor_url))
-    if settings.gateway_mode == "byok" and (not _production_database_url_is_safe(executor_url) or executor_user != "kunlun_vault_executor" or executor_user == runtime_user):
+    if settings.gateway_mode in {"byok", "managed_gateway"} and (not _production_database_url_is_safe(executor_url) or executor_user != "kunlun_vault_executor" or executor_user == runtime_user):
         errors.append("Vault executor URL 必须是独立的 kunlun_vault_executor verify-full 连接")
 
     if not errors:
@@ -708,12 +708,15 @@ def main() -> int:
             assert_schema_revision(engine, SCHEMA_HEAD)
             errors.extend(_runtime_permission_errors(engine, runtime_user))
             errors.extend(_supabase_rls_errors(engine))
-            if settings.gateway_mode == "byok":
+            if settings.gateway_mode in {"byok", "managed_gateway"}:
                 executor_engine = build_engine(executor_url)
                 try:
                     migrator_engine = build_engine(migrator_url)
                     try:
                         errors.extend(_vault_contract_errors(engine, executor_engine, runtime_user, executor_user))
+                        if settings.gateway_mode == "managed_gateway":
+                            from app.services.platform_credentials import platform_contract_errors
+                            errors.extend(platform_contract_errors(engine, executor_engine))
                         errors.extend(_installation_marker_errors(
                             engine,
                             migrator_engine,
@@ -739,7 +742,10 @@ def main() -> int:
             print(f"- {item}")
         return 1
     print("生产技术预检通过。")
-    print("仍需人工验收：TLS/WAF、备份恢复、客户开通、真实 BYOK 调用/成本对账及合规材料；不提供充值收款。")
+    if settings.gateway_mode == "managed_gateway":
+        print("仍需人工验收：TLS/WAF、备份恢复、供应商商业用途依据、真实小额支付/调用/退款及成本对账；技术预检不等于商业上线。")
+    else:
+        print("仍需人工验收：TLS/WAF、备份恢复、客户开通、真实 BYOK 调用/成本对账及合规材料；不提供充值收款。")
     return 0
 
 

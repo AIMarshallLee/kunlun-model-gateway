@@ -29,6 +29,9 @@ from . import providers
 from .auth import Principal, enforce_auth_rate_limit, require_api_key, require_operator_scope, require_session
 from .config import Settings
 from .customer_delivery import router as delivery_router, recorded_request_response
+from .managed_gateway import router as managed_router
+from .services import request_limits
+from .services.platform_credentials import SupabasePlatformVault
 from .client_ip import TrustedProxyClientIPMiddleware
 from .db import Base, build_engine, build_session_factory, install_ledger_guards
 from .db_guards import SCHEMA_HEAD, assert_schema_revision
@@ -214,6 +217,7 @@ def create_app(
     topup_packages: dict[str, dict[str, Any]] | None = None,
     provider_clients: list[Any] | None = None,
     credential_vault: CredentialVault | None = None,
+    platform_vault: Any | None = None,
     gateway_mode: str | None = None,
     vault_backend: str | None = None,
     environment: str | None = None,
@@ -242,6 +246,10 @@ def create_app(
     )
     if settings.gateway_mode == "byok" and settings.environment == "test" and credential_vault is None:
         raise RuntimeError("test BYOK 必须显式注入 CredentialVault")
+    if settings.gateway_mode == "managed_gateway" and settings.environment == "test" and platform_vault is None:
+        raise RuntimeError("test 平台模式必须显式注入 platform Vault")
+    if settings.gateway_mode == "managed_gateway" and (provider_clients is not None or credential_vault is not None):
+        raise RuntimeError("平台模式禁止全局 Provider 和客户 BYOK 凭据注入")
     if settings.is_production:
         injected_adapters = (
             identity_sender,
@@ -249,7 +257,7 @@ def create_app(
             content_safety_adapter,
             live_payment_bridge,
         )
-        if any(adapter is not None for adapter in injected_adapters) or provider_clients is not None or credential_vault is not None:
+        if any(adapter is not None for adapter in injected_adapters) or provider_clients is not None or credential_vault is not None or platform_vault is not None:
             # The supported production entrypoint builds every live adapter
             # from validated Settings. Dependency injection is reserved for
             # local/test processes so a custom ASGI bootstrap cannot bypass
@@ -263,6 +271,7 @@ def create_app(
         openapi_url="/openapi.json" if not settings.is_production else None,
     )
     app.include_router(delivery_router)
+    app.include_router(managed_router)
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -322,7 +331,14 @@ def create_app(
     # The only production constructor is the Settings-bound Vault adapter.
     # Test injection remains available outside production, after the engine
     # exists so a real adapter can probe its actual database role.
-    app.state.credential_vault = credential_vault or build_credential_vault(settings, app.state.engine)
+    app.state.credential_vault = (DisabledCredentialVault() if settings.gateway_mode == "managed_gateway"
+                                  else credential_vault or build_credential_vault(settings, app.state.engine))
+    app.state.platform_vault = platform_vault
+    if settings.gateway_mode == "managed_gateway" and settings.is_production:
+        from .services.platform_credentials import platform_contract_errors
+        app.state.platform_vault = SupabasePlatformVault(build_engine(settings.vault_executor_database_url))
+        if platform_contract_errors(app.state.engine, app.state.platform_vault.engine):
+            raise RuntimeError("平台 Vault 隔离契约未通过，拒绝启动")
     if settings.is_production:
         # The runtime database role is intentionally not a migrator. A stale
         # or empty schema fails before any business endpoint is exposed.
@@ -333,7 +349,7 @@ def create_app(
     _seed_prices(app)
     if provider_clients is not None:
         providers.ordered_clients = list(provider_clients)
-    elif settings.live_upstream:
+    elif settings.live_upstream and settings.gateway_mode != "managed_gateway":
         providers.ordered_clients = providers.build_provider_clients(
             settings.providers,
             allowed_hosts=settings.provider_host_allowlist,
@@ -424,6 +440,8 @@ def create_app(
         else:
             checks["schema_revision"] = True
         checks["providers"] = not settings.live_upstream or bool(providers.ordered_clients)
+        if settings.gateway_mode == "managed_gateway":
+            checks["providers"] = bool(settings.providers)
         checks["captcha"] = not settings.captcha_required or app.state.captcha is not None
         checks["content_safety"] = not settings.content_safety_required or app.state.content_safety is not None
         checks["payment_bridge"] = not settings.live_payments or app.state.live_payment_bridge is not None
@@ -434,6 +452,8 @@ def create_app(
                 checks["credential_vault"] = bool(app.state.credential_vault.probe())
             except Exception:
                 checks["credential_vault"] = False
+        if settings.gateway_mode == "managed_gateway":
+            checks["credential_vault"] = bool(app.state.platform_vault.probe())
         report = readiness_report(checks)
         report.update({
             "public_signup": settings.public_signup,
@@ -771,6 +791,8 @@ def create_app(
 
     @app.get("/v1/provider-connections")
     def list_provider_connections(principal: Principal = Depends(require_session)) -> dict[str, Any]:
+        if settings.gateway_mode == "managed_gateway":
+            raise HTTPException(403, "平台模式不接收客户上游密钥")
         with app.state.SessionLocal() as session:
             rows = session.scalars(select(ProviderConnection).where(
                 ProviderConnection.user_id == principal.user_id,
@@ -784,6 +806,8 @@ def create_app(
         principal: Principal = Depends(require_session),
     ) -> JSONResponse:
         provider = provider.strip().casefold()
+        if settings.gateway_mode == "managed_gateway":
+            raise HTTPException(403, "平台模式不接收客户上游密钥")
         if provider not in providers.BYOK_PROVIDER_CATALOG:
             raise HTTPException(status_code=404, detail="Provider 不在服务端允许目录中")
         secret = payload.secret.get_secret_value()
@@ -874,6 +898,8 @@ def create_app(
 
     @app.delete("/v1/provider-connections/{provider}", status_code=204)
     def revoke_provider_connection(provider: str, principal: Principal = Depends(require_session)) -> Response:
+        if settings.gateway_mode == "managed_gateway":
+            raise HTTPException(403, "平台模式不使用客户上游连接")
         provider = provider.strip().casefold()
         if app.state.credential_vault.manages_metadata:
             try:
@@ -1245,8 +1271,8 @@ def create_app(
         # Keep the key in the same bounded ASCII namespace as payment commands.
         # Reject before provider selection or reservation so malformed retries
         # cannot create billing state or reach an upstream.
-        if settings.is_production and settings.gateway_mode == "byok" and not idempotency_key:
-            return _openai_error(428, "production BYOK 请求必须提供 Idempotency-Key", "idempotency_key_required")
+        if ((settings.is_production and settings.gateway_mode == "byok") or settings.gateway_mode == "managed_gateway") and not idempotency_key:
+            return _openai_error(428, "此网关模式要求提供 Idempotency-Key", "idempotency_key_required")
         if idempotency_key is not None and not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", idempotency_key,
         ):
@@ -1291,6 +1317,10 @@ def create_app(
                 for _connection, catalog in byok_candidates
             )
             eligible: list[Any] = byok_candidates
+        elif settings.gateway_mode == "managed_gateway":
+            eligible = [item for item in settings.providers if payload.model in item.get("models", [])]
+            candidate_input_floor = max((item["pricing"][payload.model]["input_microusd_per_million"] for item in eligible), default=0)
+            candidate_output_floor = max((item["pricing"][payload.model]["output_microusd_per_million"] for item in eligible), default=0)
         else:
             candidate_input_floor = None
             candidate_output_floor = None
@@ -1361,6 +1391,8 @@ def create_app(
                         session, user_id=principal.user_id, api_key_id=principal.api_key_id or "",
                         model=payload.model, billable_payload=billable_payload,
                         max_output_tokens=max_output, idempotency_key=idempotency_key,
+                        managed_cost_prices=(candidate_input_floor, candidate_output_floor) if settings.gateway_mode == "managed_gateway" else None,
+                        platform_daily_limit=settings.platform_daily_budget_microusd,
                     )
                 )
             except BillingError as exc:
@@ -1376,7 +1408,14 @@ def create_app(
                 ).values(request_id=reservation.request_id))
                 session.commit()
         last_error: ProviderError | None = None
+        route_deadline = time.monotonic() + request_limits.MANAGED_REQUEST_SECONDS if settings.gateway_mode == "managed_gateway" else None
         for index, candidate in enumerate(eligible):
+            if route_deadline is not None and time.monotonic() >= route_deadline:
+                # Reached only before the first attempt or after an explicitly
+                # non-billable failure. No uncertain request reaches this branch.
+                with app.state.SessionLocal() as session:
+                    release_model_request(session, reservation.request_id, "routing_deadline_exceeded")
+                return _openai_error(504, "路由总时限已耗尽，未继续外呼", "routing_deadline_exceeded", request_id=reservation.request_id)
             attempt_started_at = utcnow()
             connection: ProviderConnection | None = None
             attempt_metadata: dict[str, Any] = {}
@@ -1415,6 +1454,25 @@ def create_app(
                     "credential_version": connection.credential_version,
                     "pricing_snapshot": {"source": "provider_catalog"},
                 }
+            elif settings.gateway_mode == "managed_gateway":
+                catalog = candidate
+                try:
+                    transient_secret, channel_id, channel_version = app.state.platform_vault.resolve(catalog["name"])
+                    client = providers.build_managed_provider_client(catalog, api_key=transient_secret, allowed_hosts=settings.provider_host_allowlist)
+                    attempt_metadata = {"credential_connection_id": channel_id, "credential_version": channel_version}
+                except (SecretUnavailable, RuntimeError):
+                    with app.state.SessionLocal() as session:
+                        attempt_id = record_attempt(session, request_id=reservation.request_id, ordinal=index + 1,
+                            provider=catalog["name"], model=payload.model, status="failed", billing_status="not_billed",
+                            failure_category="platform_credential_unavailable")
+                    if index + 1 < len(eligible):
+                        continue
+                    with app.state.SessionLocal() as session:
+                        release_model_request(session, reservation.request_id, "platform_credential_unavailable", attempt_id=attempt_id)
+                    return _openai_error(503, "平台供应渠道不可用", "platform_credential_unavailable", request_id=reservation.request_id)
+                finally:
+                    if "transient_secret" in locals():
+                        del transient_secret
             else:
                 client = candidate
             name = providers.provider_name(client, index)
@@ -1432,7 +1490,7 @@ def create_app(
             try:
                 open_stream = getattr(type(client), "open_stream", None)
                 if direct_upstream_stream and callable(open_stream):
-                    upstream_stream = await open_stream(client, upstream_payload)
+                    upstream_stream = await request_limits.await_with_deadline(open_stream(client, upstream_payload), route_deadline)
                     try:
                         with app.state.SessionLocal() as session:
                             attempt_id = record_attempt(
@@ -1459,7 +1517,7 @@ def create_app(
 
                     async def forward_stream():
                         try:
-                            async for chunk in upstream_stream.chunks():
+                            async for chunk in request_limits.chunks_with_deadline(upstream_stream.chunks(), route_deadline):
                                 tracker.feed(chunk)
                                 yield chunk
                             tracker.finish()
@@ -1554,7 +1612,7 @@ def create_app(
                             "Cache-Control": "no-cache, no-store",
                         },
                     )
-                result = await client(upstream_payload)
+                result = await request_limits.await_with_deadline(client(upstream_payload), route_deadline)
                 if not isinstance(result, dict):
                     raise ProviderError(502, category="provider_invalid_payload", safe_to_failover=False, request_may_be_billable=True)
                 with app.state.SessionLocal() as session:

@@ -54,6 +54,8 @@ try:
     assert _runtime_permission_errors(runtime, "kunlun_runtime") == []
     assert _supabase_rls_errors(runtime) == []
     assert _vault_contract_errors(runtime, executor, "kunlun_runtime", "kunlun_vault_executor") == []
+    from app.services.platform_credentials import platform_contract_errors, SupabasePlatformVault
+    assert platform_contract_errors(runtime, executor) == []
     assert _installation_marker_errors(
         runtime, migrator, executor,
         "kunlun_runtime", "kunlun_migrator", "kunlun_vault_executor",
@@ -88,6 +90,52 @@ try:
     assert vault.get(**current) == 'ci-inert-rotated-key'
     vault.revoke(user_id=user_id, provider='openai')
     must_reject(current)
+    platform = SupabasePlatformVault(executor)
+    metadata = platform.write(provider='openai', secret='ci-inert-platform-key', operation_id='ci-platform-create', actor='ci-operator', reason='isolated CI credential test')
+    assert metadata['active'] and 'ci-inert-platform-key' not in str(metadata)
+    assert platform.resolve('openai')[0] == 'ci-inert-platform-key'
+    assert platform.operation('ci-platform-create')['action'] == 'provision'
+    assert platform.operation('ci-platform-missing') is None
+    try:
+        platform.write(provider='openai', secret='must-not-replace', operation_id='ci-platform-create', actor='ci-operator', reason='duplicate CI credential test')
+    except SecretUnavailable:
+        pass
+    else:
+        raise AssertionError('duplicate platform operation changed credentials')
+    assert platform.resolve('openai')[0] == 'ci-inert-platform-key'
+    rotated = platform.write(provider='openai', secret='ci-inert-platform-rotated', operation_id='ci-platform-rotate', actor='ci-operator', reason='isolated CI credential rotation')
+    assert rotated['version'] == metadata['version'] + 1
+    platform.write(provider='openai', secret=None, operation_id='ci-platform-revoke', actor='ci-operator', reason='isolated CI credential revocation')
+    try:
+        platform.resolve('openai')
+    except SecretUnavailable:
+        pass
+    else:
+        raise AssertionError('revoked platform credential remained accessible')
+    # Negative preflight: inherited/effective column access and a disabled
+    # append-only trigger must each fail closed. Restore this isolated fixture.
+    with migrator.begin() as connection:
+        connection.execute(text('GRANT SELECT(provider) ON kunlun_private.platform_channels TO anon'))
+    try:
+        assert platform_contract_errors(runtime, executor)
+    finally:
+        with migrator.begin() as connection:
+            connection.execute(text('REVOKE SELECT(provider) ON kunlun_private.platform_channels FROM anon'))
+    with migrator.begin() as connection:
+        connection.execute(text('ALTER TABLE kunlun_private.platform_channel_audits DISABLE TRIGGER platform_audit_immutable'))
+    try:
+        assert platform_contract_errors(runtime, executor)
+    finally:
+        with migrator.begin() as connection:
+            connection.execute(text('ALTER TABLE kunlun_private.platform_channel_audits ENABLE TRIGGER platform_audit_immutable'))
+    try:
+        with migrator.begin() as connection:
+            connection.execute(text("DELETE FROM kunlun_private.platform_channel_audits WHERE operation_id='ci-platform-create'"))
+    except Exception:
+        pass
+    else:
+        raise AssertionError('platform operation audit was not append-only')
+    assert platform_contract_errors(runtime, executor) == []
 finally:
     runtime.dispose()
     migrator.dispose()
@@ -110,6 +158,9 @@ with connect("kunlun_runtime", os.environ["KUNLUN_RUNTIME_DB_PASSWORD"]) as conn
     for query in (
         "SELECT vault_ref FROM kunlun_private.provider_credential_bindings LIMIT 1",
         "SELECT kunlun_private.credential_resolve_v2(gen_random_uuid(), gen_random_uuid(), 'openai', 1)",
+        "SELECT * FROM kunlun_private.platform_channels",
+        "SELECT * FROM kunlun_private.platform_channel_audits",
+        "SELECT * FROM kunlun_private.platform_channel_resolve('openai')",
     ):
         try:
             with conn.cursor() as cur:
@@ -141,3 +192,4 @@ fi
 "${root_psql[@]}" -c "REVOKE kunlun_runtime FROM kunlun_migrator"
 
 echo "PostgreSQL 16 isolated role/Vault/ACL gate passed (fake Vault fixture only)."
+"$python_bin" scripts/verify_managed_postgres.py
