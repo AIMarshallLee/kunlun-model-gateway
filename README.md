@@ -6,7 +6,7 @@ Kunlun Model Gateway 当前开发目标是海外商业模型 API 聚合站：客
 
 当前是商业内核开发候选，尚未完成整站商业化。实现和剩余门槛见 [商业内核验收说明](docs/MANAGED-CORE-ACCEPTANCE.md)。默认关闭公开注册、测试支付和真实上游；支付 bridge 仍只是官方 SDK sidecar 的协议适配层，正式支付渠道尚未选定接通，不能把模拟回调或本地 Docker 称为真实收款。
 
-原 [客户开通与上线验收手册](docs/CUSTOMER-DELIVERY.md) 和生产环境模板仍针对 BYOK，不能直接作为商业站发布指南。下方快速启动是旧额度模式的本地模拟；新商业模式使用显式注入的测试适配器验收，不允许打开旧 `legacy_test` 模式上线。
+原 [客户开通与上线验收手册](docs/CUSTOMER-DELIVERY.md) 和旧生产环境模板仍针对 BYOK，不能直接作为商业站发布指南。新增独立的 [商业模式部署准备](docs/MANAGED-DEPLOYMENT.md)，包含 Vercel／Compose 模板、服务级密钥隔离和两级预检；空模板会失败，不代表已接通正式支付或批准上线。下方快速启动是旧额度模式的本地模拟；新商业模式使用显式注入的测试适配器验收，不允许打开旧 `legacy_test` 模式上线。
 
 ## 快速启动（本地模拟，非生产 BYOK）
 

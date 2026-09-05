@@ -8,6 +8,7 @@ payment/refund has been verified.
 
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 import secrets
@@ -664,7 +665,7 @@ def _vault_contract_errors(engine, executor_engine, runtime_user: str, executor_
     return errors
 
 
-def main() -> int:
+def main(*, config_only: bool = False, require_managed_launch: bool = False) -> int:
     errors: list[str] = []
     try:
         # The production compose file injects KUNLUN_DATABASE_URL separately
@@ -679,6 +680,16 @@ def main() -> int:
         return 1
     if not settings.is_production:
         errors.append("KUNLUN_ENV=production")
+    if require_managed_launch:
+        if settings.gateway_mode != "managed_gateway":
+            errors.append("商业发布检查要求 KUNLUN_GATEWAY_MODE=managed_gateway")
+        for field, enabled in (
+            ("KUNLUN_PUBLIC_SIGNUP", settings.public_signup),
+            ("KUNLUN_LIVE_PAYMENTS", settings.live_payments),
+            ("KUNLUN_LIVE_UPSTREAM", settings.live_upstream),
+        ):
+            if not enabled:
+                errors.append(f"商业发布检查要求 {field}=true；仅在对应授权和验收完成后启用")
     if settings.gateway_mode in {"byok", "managed_gateway"} and (
         not settings.identity_token_pepper_persisted or len(settings.identity_token_pepper) < 32
     ):
@@ -702,7 +713,7 @@ def main() -> int:
     if settings.gateway_mode in {"byok", "managed_gateway"} and (not _production_database_url_is_safe(executor_url) or executor_user != "kunlun_vault_executor" or executor_user == runtime_user):
         errors.append("Vault executor URL 必须是独立的 kunlun_vault_executor verify-full 连接")
 
-    if not errors:
+    if not errors and not config_only:
         engine = build_engine(settings.database_url)
         try:
             assert_schema_revision(engine, SCHEMA_HEAD)
@@ -741,6 +752,10 @@ def main() -> int:
         for item in errors:
             print(f"- {item}")
         return 1
+    if config_only:
+        print("配置静态检查通过：仅核验配置与数据库 URL/角色目标，未连接数据库或外部服务。")
+        print("未验证 schema、权限、Vault 凭据、正式支付 SDK、供应商授权或真实交易；不等于商业上线。")
+        return 0
     print("生产技术预检通过。")
     if settings.gateway_mode == "managed_gateway":
         print("仍需人工验收：TLS/WAF、备份恢复、供应商商业用途依据、真实小额支付/调用/退款及成本对账；技术预检不等于商业上线。")
@@ -749,5 +764,13 @@ def main() -> int:
     return 0
 
 
+def cli(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config-only", action="store_true", help="Only validate local configuration; never connect to a database or service")
+    parser.add_argument("--require-managed-launch", action="store_true", help="Require managed mode and the complete signup/payment/upstream feature profile")
+    args = parser.parse_args(argv)
+    return main(config_only=args.config_only, require_managed_launch=args.require_managed_launch)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

@@ -111,6 +111,9 @@ jobs:
       - name: Build the Vercel container image
         run: docker build --file Dockerfile.vercel --tag kunlun-vercel-smoke .
 
+      - name: Verify the installed preflight CLI without network access
+        run: docker run --rm --network none kunlun-vercel-smoke kunlun-production-preflight --help
+
       - name: Start the image and verify HTTP health
         run: |
           docker run --detach --name kunlun-vercel-smoke \
