@@ -142,6 +142,7 @@ def main():
             if budget is None:
                 raise RuntimeError("Run ci_postgres_gate.sh first; a frozen synthetic day ceiling is required")
             frozen_ceiling = budget.limit_microusd
+            spent_before = budget.spent_microusd
         principals = [seed_principal(engine), seed_principal(engine)]
         empty = seed_principal(engine, funded=False)
         with ExitStack() as stack:
@@ -216,6 +217,7 @@ def main():
                 assert db.get(Wallet, user_ids[0]).reserved_microusd == held
                 day = db.get(PlatformDailyBudget, uncertain.platform_budget_period)
                 assert day.limit_microusd == frozen_ceiling
+                assert day.spent_microusd == spent_before + sum(r.upstream_cost_microusd for r in settled)
                 assert uncertain.platform_reserved_microusd > 0
                 expected_holds = db.scalar(select(func.coalesce(func.sum(ModelRequest.platform_reserved_microusd), 0)).where(
                     ModelRequest.platform_budget_period == day.period,
